@@ -1,5 +1,4 @@
-Fixed OOM issues
-Support HEIC
+Fixed OOM issues; Support HEIC
 
 ---
 title: Camera
