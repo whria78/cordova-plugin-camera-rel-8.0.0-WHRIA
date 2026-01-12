@@ -1,3 +1,5 @@
+Fixed OOM issues
+
 ---
 title: Camera
 description: Take pictures with the device camera.
