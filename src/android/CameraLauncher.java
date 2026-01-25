@@ -18,6 +18,12 @@
 */
 package org.apache.cordova.camera;
 
+import android.app.ActivityManager;
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+
+
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
@@ -67,8 +73,6 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 
-// WHRIA
-import android.graphics.ImageDecoder;
 
 /**
  * This class launches the camera view, allows the user to take a picture, closes the camera view,
@@ -311,6 +315,9 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
 
     public void takePicture(int returnType, int encodingType)
     {
+        
+        this.releaseMemory();
+        
         // Let's use the intent and see what happens
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
 
@@ -385,6 +392,8 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     // TODO: Images selected from SDCARD don't display correctly, but from CAMERA ALBUM do!
     // TODO: Images from kitkat filechooser not going into crop function
     public void getImage(int srcType, int returnType) {
+        this.releaseMemory();
+
         Intent intent = new Intent();
         String title = GET_PICTURE;
         croppedUri = null;
@@ -476,6 +485,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 e.printStackTrace();
                 LOG.e(LOG_TAG, "Unable to write to file");
             }
+            
         }
     }
 
@@ -556,21 +566,47 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         }
 
         // 6. 비트맵 디코딩 (핵심 개선 사항)
-        // 기존 readData(byte[]) 대신 스트림 기반의 getScaledAndRotatedBitmapFromUri 사용
+        // 기존 readData(byte[]) 대신 스트림 기반의 GetScaledAndRotatedBitmapFromUri 사용
+
         try {
-            bitmap = getScaledAndRotatedBitmapFromUri(sourceUri);
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+        }
+        
+        try {
+            bitmap = GetScaledAndRotatedBitmapFromUri(sourceUri);
         } catch (OutOfMemoryError e) {
             LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromCamera", e);
             this.failPicture("Out of memory while processing camera image.");
             return;
         }
 
+        // [수정됨] bitmap이 null이면 100ms 대기 후 재시도
         if (bitmap == null) {
-            LOG.d(LOG_TAG, "Unable to create bitmap from uri: " + sourceUri);
-            this.failPicture("Unable to create bitmap!");
-            return;
-        }
+            try {
+                LOG.d(LOG_TAG, "Bitmap is null. Waiting 100ms to retry...");
+                Thread.sleep(100); // 100ms 대기
+            } catch (InterruptedException e) {
+                // InterruptedException 무시 또는 로그 처리
+            }
 
+            // 한 번 더 시도
+            try {
+                bitmap = GetScaledAndRotatedBitmapFromUri(sourceUri);
+            } catch (OutOfMemoryError e) {
+                LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromCamera (Retry)", e);
+                this.failPicture("Out of memory while processing camera image.");
+                return;
+            }
+
+            // 재시도 후에도 여전히 null인 경우 최종 실패 처리
+            if (bitmap == null) {
+                LOG.d(LOG_TAG, "Unable to create bitmap from uri: " + sourceUri);
+                this.failPicture("Unable to create bitmap!");
+                return;
+            }
+        }
+        
         // 7. 결과 처리 (Base64 또는 파일 URI 반환)
         if (destType == DATA_URL) {
             this.processPicture(bitmap, this.encodingType);
@@ -587,7 +623,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             // Exif 데이터 복원 (JPEG인 경우)
             if (this.encodingType == JPEG) {
                 String exifPath = uri.getPath();
-                // getScaledAndRotatedBitmapFromUri에서 이미 이미지를 물리적으로 회전시켰으므로,
+                // GetScaledAndRotatedBitmapFromUri에서 이미 이미지를 물리적으로 회전시켰으므로,
                 // Exif의 Orientation 태그는 'Normal(1)'로 초기화해야 중복 회전이 안 됨
                 if (rotate != ExifInterface.ORIENTATION_NORMAL) {
                     exif.resetOrientation();
@@ -698,14 +734,34 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         return this.encodingType == JPEG ? JPEG_EXTENSION : PNG_EXTENSION;
     }
 
-
+ 
     /**
      * Applies all needed transformation to the image received from the gallery.
      *
      * @param destType In which form should we return the image
      * @param intent   An Intent, which can return result data to the caller (various data can be attached to Intent "extras").
      */
+     
     private void processResultFromGallery(int destType, Intent intent) {
+        // final 캡처
+        final int finalDestType = destType;
+        final Intent finalIntent = intent;
+
+        // 1. UI 스레드에서 지연(Delay) 처리
+        new android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed(() -> {
+                    // 2. 지연 시간이 끝난 후, 무거운 작업은 다시 백그라운드 스레드풀로 전달해야 함 (중요!)
+                    cordova.getThreadPool().execute(() -> {
+
+                        //System.gc();
+                        //System.runFinalization();
+                        
+                        processResultFromGallery_ex(finalDestType, finalIntent);
+                    });
+                }, 50);
+    }    
+    
+    private void processResultFromGallery_ex(int destType, Intent intent) {
         Uri uri = intent.getData();
         if (uri == null) {
             if (croppedUri != null) {
@@ -746,20 +802,49 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             final Uri finalUri = uri;
 
             cordova.getThreadPool().execute(() -> {
+                // [추가됨] 1. 첫 시도 전 50ms 대기
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    // 무시
+                }
+
+                // 첫 번째 시도
+                try {
+                    String jpegPath = convertHeicToJpeg(finalUri);
+                    callbackContext.success(jpegPath);
+                    return; // 성공하면 여기서 종료
+                } catch (Throwable t) {
+                    // 첫 시도 실패 시 로그만 남기고 재시도 단계로 진행
+                    // (Throwable을 사용하여 Exception과 OutOfMemoryError를 모두 잡음)
+                    LOG.w(LOG_TAG, "First HEIC conversion attempt failed. Retrying in 100ms...", t);
+                }
+
+                // [추가됨] 2. 100ms 대기 (재시도 전)
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    // 무시
+                }
+
+                // 3. 재시도 (최종)
                 try {
                     String jpegPath = convertHeicToJpeg(finalUri);
                     callbackContext.success(jpegPath);
                 } catch (OutOfMemoryError oom) {
-                    LOG.e(LOG_TAG, "OOM converting HEIC", oom);
+                    // 재시도에서도 메모리 부족 발생 시 에러 리턴
+                    LOG.e(LOG_TAG, "OOM converting HEIC (Retry)", oom);
                     callbackContext.error("Out of memory");
                 } catch (Exception e) {
-                    LOG.e(LOG_TAG, "Error converting HEIC", e);
+                    // 재시도에서도 일반 예외 발생 시 에러 리턴
+                    LOG.e(LOG_TAG, "Error converting HEIC (Retry)", e);
                     callbackContext.error(e.getMessage());
                 }
             });
             return;
         }
-
+        
+        
         // WHRIA: 일반 이미지(JPG/PNG) 처리 로직 개선 (OOM 방지)
         // 기존의 readData(byte[]) 방식을 제거하고 InputStream을 사용
 
@@ -772,7 +857,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         }
         
         // 1. Exif 데이터 보존을 위해 ExifHelper 초기화 (JPEG인 경우)
-        // 주의: getScaledAndRotatedBitmapFromUri 호출 전에 미리 읽어둬야 함
+        // 주의: GetScaledAndRotatedBitmapFromUri 호출 전에 미리 읽어둬야 함
         if (this.encodingType == JPEG) {
             InputStream exifInput = null;
             try {
@@ -789,9 +874,17 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         }
 
         Bitmap bitmap = null;
+
+        // [추가됨] 1. 첫 시도 전 50ms 대기
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+            // InterruptedException 무시
+        }
+
         try {
             // [개선된 로직] byte[] 로딩 없이 스트림에서 바로 디코딩 및 회전
-            bitmap = getScaledAndRotatedBitmapFromUri(uri);
+            bitmap = GetScaledAndRotatedBitmapFromUri(uri);
         } catch (OutOfMemoryError e) {
             // 메모리 부족 발생 시 명시적으로 에러 처리
             LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromGallery", e);
@@ -804,12 +897,36 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             return;
         }
 
+        // [추가됨] 2. bitmap이 null이면 100ms 대기 후 재시도
         if (bitmap == null) {
-            LOG.d(LOG_TAG, "I either have an unreadable uri or null bitmap");
-            this.failPicture("Unable to create bitmap!");
-            return;
-        }
+            try {
+                LOG.d(LOG_TAG, "Bitmap is null. Waiting 100ms to retry...");
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                // InterruptedException 무시
+            }
 
+            try {
+                // 재시도
+                bitmap = GetScaledAndRotatedBitmapFromUri(uri);
+            } catch (OutOfMemoryError e) {
+                LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromGallery (Retry)", e);
+                this.failPicture("Out of memory while loading image.");
+                return;
+            } catch (Exception e) {
+                LOG.e(LOG_TAG, "Error loading image (Retry)", e);
+                this.failPicture("Error retrieving image: " + e.getLocalizedMessage());
+                return;
+            }
+
+            // 3. 재시도 후에도 여전히 null이면 최종 실패 처리
+            if (bitmap == null) {
+                LOG.d(LOG_TAG, "I either have an unreadable uri or null bitmap");
+                this.failPicture("Unable to create bitmap!");
+                return;
+            }
+        }
+        
         // If sending base64 image back
         if (destType == DATA_URL) {
             this.processPicture(bitmap, this.encodingType);
@@ -848,7 +965,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     /**
      * [New Method] Uri로부터 InputStream을 이용해 메모리 효율적으로 비트맵을 로드하고 회전
      */
-private Bitmap getScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
+private Bitmap GetScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
     ContentResolver resolver = this.cordova.getActivity().getContentResolver();
 
     BitmapFactory.Options opts = new BitmapFactory.Options();
@@ -899,7 +1016,8 @@ private Bitmap getScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
     // 4️⃣ 실제 decode (메모리 절감 핵심)
     opts.inJustDecodeBounds = false;
     opts.inPreferredConfig = Bitmap.Config.RGB_565;
-    opts.inMutable = true;
+    opts.inMutable = false;
+    opts.inDither = true;
 
     Bitmap bitmap;
     try (InputStream is = resolver.openInputStream(uri)) {
@@ -930,6 +1048,7 @@ private Bitmap getScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
             this.orientationCorrected = false;
         }
     }
+   
 
     return bitmap;
 }
@@ -1002,7 +1121,8 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         // =========================================================
         options.inJustDecodeBounds = false;
         options.inPreferredConfig = Bitmap.Config.RGB_565; // 🔥 50% 절감
-        options.inMutable = true;
+        options.inMutable = false;
+        options.inDither = true;
 
         try (InputStream is = resolver.openInputStream(uri)) {
             bitmap = BitmapFactory.decodeStream(is, null, options);
@@ -1075,6 +1195,8 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
 }
 
 
+
+
     /**
      * JPEG, PNG and HEIC mime types (images) can be scaled, decreased in quantity, corrected by orientation.
      * But f.e. an image/gif cannot be scaled, but is can be selected through the PHOTOLIBRARY.
@@ -1104,18 +1226,26 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         // If Camera Crop
         if (requestCode >= CROP_CAMERA) {
             if (resultCode == Activity.RESULT_OK) {
+        
+            final int finalDestType = requestCode - CROP_CAMERA;
+            final Intent finalIntent = intent;
 
-                // Because of the inability to pass through multiple intents, this hack will allow us
-                // to pass arcane codes back.
-                destType = requestCode - CROP_CAMERA;
+            // ThreadPool을 사용하여 백그라운드에서 실행
+            cordova.getThreadPool().execute(() -> {
                 try {
-                    processResultFromCamera(destType, intent);
+                    processResultFromCamera(finalDestType, finalIntent);
                 } catch (IOException e) {
                     e.printStackTrace();
                     LOG.e(LOG_TAG, "Unable to write to file");
+                    // 에러 발생 시 UI 스레드로 에러 전달 필요 시 runOnUiThread 사용
+                    cordova.getActivity().runOnUiThread(() -> {
+                        failPicture("Unable to write to file");
+                    });
                 }
+            });
 
-            }// If cancelled
+            }
+    
             else if (resultCode == Activity.RESULT_CANCELED) {
                 this.failPicture("No Image Selected");
             }
@@ -1129,19 +1259,57 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         else if (srcType == CAMERA) {
             // If image available
             if (resultCode == Activity.RESULT_OK) {
-                try {
-                    if (this.allowEdit) {
-                        Uri tmpFile = FileProvider.getUriForFile(cordova.getActivity(),
-                        applicationId + ".cordova.plugin.camera.provider",
-                        createCaptureFile(this.encodingType));
-                        performCrop(tmpFile, destType, intent);
-                    } else {
-                        this.processResultFromCamera(destType, intent);
-                    }
-                } catch (IOException e) {
-                    e.printStackTrace();
-                    this.failPicture("Error capturing image: "+e.getLocalizedMessage());
+                    
+                if (this.allowEdit) {
+                    
+                        try {
+                                
+                                Uri tmpFile = FileProvider.getUriForFile(
+                                        cordova.getActivity(),
+                                        applicationId + ".cordova.plugin.camera.provider",
+                                        createCaptureFile(this.encodingType)
+                                );
+                                performCrop(tmpFile, destType, intent);
+
+
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            this.failPicture("Error capturing image: " + e.getLocalizedMessage());
+                        }
+
+
+                } else {
+
+
+                    // final 캡처
+                    final int finalDestType = destType;
+                    final Intent finalIntent = intent;
+
+                    new android.os.Handler(android.os.Looper.getMainLooper())
+                            .postDelayed(() -> {
+                                
+                                cordova.getThreadPool().execute(() -> {
+                                try {
+
+                                    //System.gc();
+                                    //System.runFinalization();
+
+                                    processResultFromCamera(finalDestType, finalIntent);
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+
+                                    cordova.getActivity().runOnUiThread(() -> {
+                                        failPicture("Error capturing image: " + e.getLocalizedMessage());
+                                    });                                    
+                                    //failPicture("Error capturing image: " + e.getLocalizedMessage());
+                                }
+                                });
+                            }, 50);
+                    
+                    
                 }
+
+
             }
 
             // If cancelled
@@ -1571,5 +1739,26 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         this.callbackContext = callbackContext;
     }
 
+    // [새로 추가할 메서드] 메모리 및 캐시 강제 정리
+    private void releaseMemory() {
+        // 1. Java Heap 메모리 청소 유도 (OS에 힌트 전달)
+        System.gc();
+        System.runFinalization();
+
+        // 2. WebView 캐시 정리 (RAM에 상주하는 이미지 리소스 등 해제)
+        // WebView 조작은 반드시 UI 스레드에서 해야 함
+        cordova.getActivity().runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    // true: 디스크 캐시와 메모리 캐시를 모두 비웁니다.
+                    // 이미 loading.html로 왔으므로 이전 페이지 리소스를 다 날려도 안전합니다.
+                    webView.clearCache(true); 
+                } catch (Exception e) {
+                    LOG.e(LOG_TAG, "Error clearing webview cache", e);
+                }
+            }
+        });
+    }
 
 }
