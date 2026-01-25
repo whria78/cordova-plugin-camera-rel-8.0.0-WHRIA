@@ -1,3 +1,5 @@
+Fixed OOM issues; Support HEIC
+
 ---
 title: Camera
 description: Take pictures with the device camera.
