@@ -1,38 +1,41 @@
-/*
-       Licensed to the Apache Software Foundation (ASF) under one
-       or more contributor license agreements.  See the NOTICE file
-       distributed with this work for additional information
-       regarding copyright ownership.  The ASF licenses this file
-       to you under the Apache License, Version 2.0 (the
-       "License"); you may not use this file except in compliance
-       with the License.  You may obtain a copy of the License at
-
-         http://www.apache.org/licenses/LICENSE-2.0
-
-       Unless required by applicable law or agreed to in writing,
-       software distributed under the License is distributed on an
-       "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-       KIND, either express or implied.  See the License for the
-       specific language governing permissions and limitations
-       under the License.
-*/
 package org.apache.cordova.camera;
 
-import android.app.ActivityManager;
-import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
+
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileDescriptor; // [중요] 추가됨
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.net.URLConnection; // guessContentTypeFromName 사용 시 필요
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List; // List 클래스를 사용하기 위해 필요
 
 
+import android.content.pm.ResolveInfo; // ResolveInfo 클래스를 사용하기 위해 필요
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.pm.PackageInfo;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Bitmap.CompressFormat;
@@ -45,11 +48,18 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
-import androidx.core.content.FileProvider;
-import android.util.Base64;
 import android.system.Os;
 import android.system.OsConstants;
+import android.util.Base64;
+import android.util.Log;
+import android.content.ClipData;
+import android.provider.OpenableColumns;
+
+import androidx.core.content.FileProvider;
 
 import org.apache.cordova.BuildHelper;
 import org.apache.cordova.CallbackContext;
@@ -60,25 +70,7 @@ import org.apache.cordova.PluginResult;
 import org.json.JSONArray;
 import org.json.JSONException;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Date;
 
-
-/**
- * This class launches the camera view, allows the user to take a picture, closes the camera view,
- * and returns the captured image.  When the camera view is closed, the screen displayed before
- * the camera view was shown is redisplayed.
- */
 public class CameraLauncher extends CordovaPlugin implements MediaScannerConnectionClient {
 
     private static final int DATA_URL = 0;              // Return base64 encoded string
@@ -142,6 +134,129 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     private ExifHelper exifData;            // Exif data from source
     private String applicationId;
 
+
+    private void logreport(final Throwable t) {
+        // 1. 1차 방어: 앱이 종료된 상태면 실행하지 않음
+        if (this.cordova == null || this.cordova.getActivity() == null) {
+            return;
+        }
+
+        // 2. 10초 지연 (Handler 사용)
+        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                // =========================================================
+                // 3. 10초 후 실행되는 시점
+                // =========================================================
+                
+                // 2차 방어: 10초 사이에 사용자가 앱을 껐거나 Activity가 사라졌는지 확인
+                if (cordova == null || cordova.getActivity() == null || cordova.getActivity().isFinishing()) {
+                    return;
+                }
+
+                // 4. 실제 무거운 작업(네트워크/파일)은 백그라운드 스레드 풀로 위임
+                cordova.getThreadPool().execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        HttpURLConnection conn = null;
+                        try {
+                            Context context = cordova.getActivity(); // Context 참조
+
+                            // --- [추가] 앱 버전 정보 수집 ---
+                            String appVersion = "Unknown";
+                            try {
+                                PackageManager pm = context.getPackageManager();
+                                PackageInfo pInfo = pm.getPackageInfo(context.getPackageName(), 0);
+                                // 예: 1.0.3 (Build 12) 형식
+                                appVersion = pInfo.versionName + " (Build " + pInfo.versionCode + ")";
+                            } catch (Exception e) {
+                                // 버전 정보 가져오기 실패 시 무시
+                            }
+
+                            // --- (기존 로직) 메모리 정보 수집 ---
+                            String memoryInfo = "Memory Info Unavailable";
+                            try {
+                                ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+                                ActivityManager activityManager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+                                if (activityManager != null) {
+                                    activityManager.getMemoryInfo(mi);
+                                    Runtime runtime = Runtime.getRuntime();
+                                    long totalRAM = mi.totalMem / 1048576L;
+                                    long availRAM = mi.availMem / 1048576L;
+                                    long maxHeap = runtime.maxMemory() / 1048576L;
+                                    long usedHeap = (runtime.totalMemory() - runtime.freeMemory()) / 1048576L;
+
+                                    memoryInfo = "RAM: " + availRAM + "/" + totalRAM + "MB, " +
+                                                 "HeapUsed: " + usedHeap + "/" + maxHeap + "MB";
+                                }
+                            } catch (Exception e) {
+                                // 메모리 체크 중 에러 무시
+                            }
+
+                            // --- (기존 로직) 로그 내용 구성 ---
+                            StackTraceElement[] stackTrace = t.getStackTrace();
+                            String location = (stackTrace != null && stackTrace.length > 0)
+                                    ? stackTrace[0].getFileName() + ":" + stackTrace[0].getLineNumber()
+                                    : "Unknown Location";
+
+                            String fullStackTrace = Log.getStackTraceString(t);
+
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("===== ERROR REPORT (Delayed 10s) =====\n");
+                            sb.append("[Location] ").append(location).append("\n");
+                            
+                            // [추가] 앱 버전 기록
+                            sb.append("[App Version] ").append(appVersion).append("\n");
+
+                            sb.append("[Device] ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+                                    .append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n");
+                            sb.append("[Memory] ").append(memoryInfo).append("\n\n");
+                            sb.append("[Stack Trace]\n").append(fullStackTrace);
+
+
+                            // --- (기존 로직) 서버 전송 ---
+                            URL url = new URL("https://app0.skindx.net/error.php");
+                            conn = (HttpURLConnection) url.openConnection();
+                            conn.setRequestMethod("POST");
+                            conn.setConnectTimeout(10000);
+                            conn.setReadTimeout(10000);
+                            conn.setDoOutput(true);
+                            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+
+                            String postData = "msg=" + URLEncoder.encode(sb.toString(), "UTF-8");
+
+                            OutputStream os = conn.getOutputStream();
+                            os.write(postData.getBytes(StandardCharsets.UTF_8));
+                            os.flush();
+                            os.close();
+
+                            int responseCode = conn.getResponseCode();
+
+                        } catch (Throwable e) {
+                            // 전송 실패 시 조용히 무시
+                        } finally {
+                            if (conn != null) {
+                                try { conn.disconnect(); } catch (Exception ignored) {}
+                            }
+                        }
+                    }
+                });
+            }
+        }, 500); // 지연 시간
+    }
+
+    // 1. Wrapper 클래스 정의
+    public class StringReportException extends Exception {
+        public StringReportException(String message) {
+            super(message);
+        }
+    }
+
+    // 2. String 전용 호출 메서드 추가
+    private void logreport(String message) {
+        // String을 Exception으로 감싸서 기존 메서드에 전달
+        logreport(new StringReportException(message));
+    }
 
     /**
      * Executes the request and returns PluginResult.
@@ -208,6 +323,9 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 callbackContext.error(e.getLocalizedMessage());
                 PluginResult r = new PluginResult(PluginResult.Status.ERROR);
                 callbackContext.sendPluginResult(r);
+
+                logreport(e);
+
                 return true;
             }
             catch (IllegalArgumentException e)
@@ -215,6 +333,9 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 callbackContext.error("Illegal Argument Exception");
                 PluginResult r = new PluginResult(PluginResult.Status.ERROR);
                 callbackContext.sendPluginResult(r);
+
+                logreport(e);
+
                 return true;
             }
 
@@ -312,39 +433,149 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             takePicture(returnType, encodingType);
         }
     }
+public void takePicture(int returnType, int encodingType) {
 
-    public void takePicture(int returnType, int encodingType)
-    {
-        
-        this.releaseMemory();
-        
-        // Let's use the intent and see what happens
-        Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+    this.releaseMemory();
 
-        // Specify file so that large image is captured and returned
-        File photo = createCaptureFile(encodingType);
-        this.imageUri = FileProvider.getUriForFile(
-            cordova.getActivity(),
-            applicationId + ".cordova.plugin.camera.provider",
-            photo
-        );
-        intent.putExtra(MediaStore.EXTRA_OUTPUT, imageUri);
-        //We can write to this URI, this will hopefully allow us to write files to get to the next step
-        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+    Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
 
-        if (this.cordova != null) {
-            // Let's check to make sure the camera is actually installed. (Legacy Nexus 7 code)
-            PackageManager mPm = this.cordova.getActivity().getPackageManager();
-            if(intent.resolveActivity(mPm) != null)
-            {
-                this.cordova.startActivityForResult((CordovaPlugin) this, intent, (CAMERA + 1) * 16 + returnType + 1);
-            }
-            else
-            {
-                LOG.d(LOG_TAG, "Error: You don't have a default camera.  Your device may not be CTS complaint.");
+    File photo = createCaptureFile(encodingType);
+
+    // ===============================
+    // 1) 물리적 파일 생성 확인
+    // ===============================
+    try {
+        if (!photo.exists()) {
+            boolean isCreated = photo.createNewFile();
+            if (!isCreated) {
+                LOG.e(LOG_TAG, "물리적 파일 생성 실패 (Permission or Path issue)");
+                this.failPicture("Capture file creation failed.");
+                logreport("Capture file creation failed.");
+                return;
             }
         }
+    } catch (IOException e) {
+        LOG.e(LOG_TAG, "파일 생성 중 예외 발생", e);
+        this.failPicture("Error creating capture file: " + e.getMessage());
+        logreport(e);
+        return;
     }
+
+    // ===============================
+    // 2) FileProvider URI 생성
+    // ===============================
+    this.imageUri = FileProvider.getUriForFile(
+            cordova.getActivity(),
+            cordova.getActivity().getPackageName() + ".cordova.plugin.camera.provider",
+            photo
+    );
+
+    // ===============================
+    // 3) EXTRA_OUTPUT 지정
+    // ===============================
+    intent.putExtra(MediaStore.EXTRA_OUTPUT, imageUri);
+
+    // ===============================
+    // 4) URI Permission Flags 부여
+    // ===============================
+    intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+    // ⚠️ setFlags()는 addFlags를 덮어쓰므로 제거함
+    // intent.setFlags(...) ❌ 사용하지 않음
+
+    // ===============================
+    // 5) 삼성 Android 14+ 대응 ClipData
+    // ===============================
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        intent.setClipData(
+                ClipData.newUri(
+                        cordova.getActivity().getContentResolver(),
+                        "camera-output",
+                        imageUri
+                )
+        );
+    }
+
+    // ===============================
+    // 6) 실행 가능한 모든 카메라 앱에 grantUriPermission
+    // ===============================
+    List<ResolveInfo> resInfoList =
+            cordova.getActivity().getPackageManager()
+                    .queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY);
+
+    for (ResolveInfo resolveInfo : resInfoList) {
+
+        if (resolveInfo.activityInfo == null) continue;
+
+        String packageName = resolveInfo.activityInfo.packageName;
+
+        cordova.getActivity().grantUriPermission(
+                packageName,
+                imageUri,
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+        );
+    }
+
+    // ===============================
+    // 7) Launch camera safely
+    // ===============================
+    PackageManager pm = cordova.getActivity().getPackageManager();
+
+    if (intent.resolveActivity(pm) != null) {
+
+        // ===============================
+        // ✅ 기기 RAM 확인
+        // ===============================
+        int delayMs = 150;
+        try {
+            ActivityManager am =
+                    (ActivityManager) cordova.getActivity()
+                            .getSystemService(Context.ACTIVITY_SERVICE);
+
+            ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            long totalRamGB = mi.totalMem / (1024L * 1024L * 1024L);
+
+            // ✅ 6GB 이하만 delay 적용
+            if (totalRamGB <= 4) {
+                delayMs = 500;
+            } else if (totalRamGB <= 6) {
+                delayMs = 400;
+            }
+        } catch (Exception ignored) {
+            delayMs = 500; // 안전 fallback
+        }
+
+        // ===============================
+        // ✅ Delay 후 카메라 실행
+        // ===============================
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+
+            try {
+                this.cordova.startActivityForResult(
+                        (CordovaPlugin) this,
+                        intent,
+                        (CAMERA + 1) * 16 + returnType + 1
+                );
+
+            } catch (Exception e) {
+                LOG.e(LOG_TAG, "Camera launch failed", e);
+                this.failPicture("Camera launch failed: " + e.getMessage());
+                logreport(e);
+            }
+
+        }, delayMs);
+
+    } else {
+
+        LOG.d(LOG_TAG, "Error: No default camera app installed.");
+        logreport("No default camera app installed.");
+        this.failPicture("No default camera app installed.");
+    }
+}
+
 
     /**
      * Create a file in the applications temporary directory based upon the supplied encoding.
@@ -356,32 +587,34 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         return createCaptureFile(encodingType, "");
     }
 
-    /**
-     * Create a file in the applications temporary directory based upon the supplied encoding.
-     *
-     * @param encodingType of the image to be taken
-     * @param fileName or resultant File object.
-     * @return a File object pointing to the temporary picture
-     */
-    private File createCaptureFile(int encodingType, String fileName) {
-        if (fileName.isEmpty()) {
-            fileName = ".Pic";
-        }
-
-        if (encodingType == JPEG) {
-            fileName = fileName + JPEG_EXTENSION;
-        } else if (encodingType == PNG) {
-            fileName = fileName + PNG_EXTENSION;
-        } else {
-            throw new IllegalArgumentException("Invalid Encoding Type: " + encodingType);
-        }
-
-        File cacheDir = new File(getTempDirectoryPath(), "org.apache.cordova.camera");
-        cacheDir.mkdir();
-
-        return new File(cacheDir, fileName);
+private File createCaptureFile(int encodingType, String fileName) {
+    if (fileName.isEmpty()) {
+        fileName = ".Pic";
     }
 
+    if (encodingType == JPEG) {
+        fileName = fileName + JPEG_EXTENSION;
+    } else if (encodingType == PNG) {
+        fileName = fileName + PNG_EXTENSION;
+    } else {
+        throw new IllegalArgumentException("Invalid Encoding Type: " + encodingType);
+    }
+
+    // getTempDirectoryPath()는 이미 cacheDir를 반환함
+    File cacheDir = new File(getTempDirectoryPath(), "org.apache.cordova.camera");
+    
+    // 핵심 수정: mkdir() 대신 mkdirs()를 사용하여 중간 경로까지 모두 생성 시도
+    if (!cacheDir.exists()) {
+        boolean created = cacheDir.mkdirs(); 
+        if (!created) {
+            LOG.e(LOG_TAG, "디렉토리 생성 실패: " + cacheDir.getAbsolutePath());
+            // 실패 시 fallback으로 기본 캐시 디렉토리 사용
+            return new File(getTempDirectoryPath(), fileName);
+        }
+    }
+
+    return new File(cacheDir, fileName);
+}
 
     /**
      * Get image from photo library.
@@ -484,10 +717,12 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             } catch (IOException e) {
                 e.printStackTrace();
                 LOG.e(LOG_TAG, "Unable to write to file");
+                logreport(e);
             }
             
         }
     }
+
 
 
 /**
@@ -496,187 +731,253 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
      * @param destType          In which form should we return the image
      * @param intent            An Intent, which can return result data to the caller.
      */
-    private void processResultFromCamera(int destType, Intent intent) throws IOException {
-        // 1. 소스 URI 결정 (크롭된 이미지인지 원본인지 확인)
-        Uri sourceUri = this.imageUri;
-        if (this.allowEdit && this.croppedUri != null) {
-            sourceUri = this.croppedUri;
+// [수정] processResultFromCamera (안전성 강화 버전)
+private void processResultFromCamera(int destType, Intent intent) throws IOException {
+
+    if (cordova.getActivity() == null || cordova.getActivity().isFinishing()) {
+        LOG.w(LOG_TAG, "Activity is finishing, aborting processResultFromCamera");
+        return; 
+    }        
+    
+    // 1. 기본 타겟 설정
+    Uri sourceUri = this.imageUri; 
+    if (this.allowEdit && this.croppedUri != null) {
+        sourceUri = this.croppedUri;
+    }
+
+    ContentResolver resolver = cordova.getActivity().getContentResolver();
+    boolean sourceExists = false;
+
+    // =========================================================================
+    // 1단계: 원본 파일 존재 확인
+    // =========================================================================
+    try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(sourceUri, "r")) {
+        if (pfd != null) {
+            sourceExists = true;
         }
+    } catch (Exception e) {
+        sourceExists = false;
+    }
 
-        // 2. MIME Type 가져오기
-        String mimeType = FileHelper.getMimeType(sourceUri.toString(), cordova);
+    // =========================================================================
+    // 2단계: Fallback 로직
+    // =========================================================================
+    if (!sourceExists) {
+        LOG.w(LOG_TAG, "Original file not found: " + sourceUri);
 
-        // 3. Exif 데이터 읽기 (InputStream 사용으로 메모리 절약)
-        // 나중에 비트맵 회전 후 Exif 태그를 복원할 때 필요함
-        int rotate = 0;
-        ExifHelper exif = new ExifHelper();
-        if (this.encodingType == JPEG) {
-            InputStream exifInput = null;
-            try {
-                exifInput = cordova.getActivity().getContentResolver().openInputStream(sourceUri);
+        if (intent != null && intent.getData() != null) {
+            sourceUri = intent.getData();
+            LOG.w(LOG_TAG, "Recovered using Intent Data: " + sourceUri);
+        } else {
+            LOG.e(LOG_TAG, "All fallback attempts failed. File is missing.");
+            logreport("Unable to find the captured file.");
+            this.failPicture("Unable to find the captured file.");
+            return;
+        }
+    }
+
+    // =========================================================================
+    // 3단계: Exif & Rotation 준비
+    // =========================================================================
+    int rotate = 0;
+    ExifHelper exif = new ExifHelper();
+    
+    if (this.encodingType == JPEG) {
+        try (InputStream exifInput = resolver.openInputStream(sourceUri)) {
+            if (exifInput != null) {
                 exif.createInFile(exifInput);
                 exif.readExifData();
                 rotate = exif.getOrientation();
-            } catch (IOException e) {
-                e.printStackTrace();
-            } finally {
-                if (exifInput != null) try { exifInput.close(); } catch (IOException ignored) {}
             }
+        } catch (Exception e) {
+            LOG.w(LOG_TAG, "Failed to read Exif: " + e.getMessage());
+            rotate = 0;
         }
+    }
 
-        Bitmap bitmap = null;
-        Uri galleryUri = null;
+    Bitmap bitmap = null;
+    Uri galleryUri = null;
 
-        // 4. 갤러리 저장 처리 (saveToPhotoAlbum)
-        // 메모리에 비트맵을 올리기 전에 처리하여 OOM 리스크 최소화
-        if (this.saveToPhotoAlbum) {
-            GalleryPathVO galleryPathVO = getPicturesPath();
-            galleryUri = Uri.fromFile(new File(galleryPathVO.getGalleryPath()));
+    // =========================================================================
+    // 4단계: 비트맵 로딩
+    // =========================================================================
+    try { Thread.sleep(300); } catch (InterruptedException e) {}
 
-            if (this.allowEdit && this.croppedUri != null) {
-                writeUncompressedImage(croppedUri, galleryUri);
-            } else {
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                    writeTakenPictureToGalleryLowerThanAndroidQ(galleryUri);
-                } else {
-                    writeTakenPictureToGalleryStartingFromAndroidQ(galleryPathVO);
-                }
-            }
-        }
+    try {
+        bitmap = GetScaledAndRotatedBitmapFromUri(sourceUri);
+    } catch (Exception e) {
+        LOG.e(LOG_TAG, "Failed to decode bitmap: " + e.getMessage());
+        bitmap = null;
+    }
 
-        // 5. [최적화] 이미지 변환(리사이징/회전)이 필요 없는 경우 빠른 리턴
-        // 이 조건을 만족하면 무거운 비트맵 디코딩 과정을 아예 건너뜁니다.
-        if (destType == FILE_URI && this.targetHeight == -1 && this.targetWidth == -1 &&
-            this.mQuality == 100 && !this.correctOrientation) {
-
-            // 갤러리에 저장된 파일이 있다면 그 경로를 반환
-            if (this.saveToPhotoAlbum) {
-                this.callbackContext.success(galleryUri.toString());
-            } else {
-                // 저장하지 않았다면 임시 파일로 복사 후 반환
-                Uri uri = Uri.fromFile(createCaptureFile(this.encodingType, System.currentTimeMillis() + ""));
-                // InputStream을 이용한 스트림 복사 (메모리 효율적)
-                writeUncompressedImage(sourceUri, uri);
-                this.callbackContext.success(uri.toString());
-            }
-            
-            // 임시 파일 정리 후 종료
-            this.cleanup(this.imageUri, galleryUri, null);
-            return;
-        }
-
-        // 6. 비트맵 디코딩 (핵심 개선 사항)
-        // 기존 readData(byte[]) 대신 스트림 기반의 GetScaledAndRotatedBitmapFromUri 사용
-
+    // Retry Logic
+    if (bitmap == null) {
         try {
-            Thread.sleep(50);
-        } catch (InterruptedException e) {
-        }
-        
-        try {
+            LOG.d(LOG_TAG, "Retry #1 decoding...");
+            Thread.sleep(500); 
             bitmap = GetScaledAndRotatedBitmapFromUri(sourceUri);
-        } catch (OutOfMemoryError e) {
-            LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromCamera", e);
-            this.failPicture("Out of memory while processing camera image.");
+        } catch (Exception e) {
+            LOG.e(LOG_TAG, "Failed to decode bitmap: " + e.getMessage());
+            bitmap = null;
+        }
+    }
+    if (bitmap == null) {
+        try {
+            LOG.d(LOG_TAG, "Retry #2 decoding...");
+            Thread.sleep(1000); 
+            bitmap = GetScaledAndRotatedBitmapFromUri(sourceUri);
+        } catch (Exception e) {
+            this.failPicture("Error processing image: " + e.getMessage());
+            logreport(e);
             return;
         }
+    }
 
-        // [수정됨] bitmap이 null이면 100ms 대기 후 재시도
-        if (bitmap == null) {
-            try {
-                LOG.d(LOG_TAG, "Bitmap is null. Waiting 100ms to retry...");
-                Thread.sleep(100); // 100ms 대기
-            } catch (InterruptedException e) {
-                // InterruptedException 무시 또는 로그 처리
-            }
-
-            // 한 번 더 시도
-            try {
-                bitmap = GetScaledAndRotatedBitmapFromUri(sourceUri);
-            } catch (OutOfMemoryError e) {
-                LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromCamera (Retry)", e);
-                this.failPicture("Out of memory while processing camera image.");
-                return;
-            }
-
-            // 재시도 후에도 여전히 null인 경우 최종 실패 처리
-            if (bitmap == null) {
-                LOG.d(LOG_TAG, "Unable to create bitmap from uri: " + sourceUri);
-                this.failPicture("Unable to create bitmap!");
-                return;
-            }
-        }
+    if (bitmap == null) {
+        logreport("Unable to create bitmap!");
+        this.failPicture("Unable to create bitmap!");
+        return;
+    }
+    
+    // =========================================================================
+    // 5단계: 결과 저장 및 반환
+    // =========================================================================
+    if (destType == DATA_URL) {
+        this.processPicture(bitmap, this.encodingType);
+    }
+    else if (destType == FILE_URI) {
         
-        // 7. 결과 처리 (Base64 또는 파일 URI 반환)
-        if (destType == DATA_URL) {
-            this.processPicture(bitmap, this.encodingType);
+        
+
+        // =======================================
+        // [SAFE] Bitmap 저장 + Fallback + Exif 처리
+        // =======================================
+
+        // 1) 기본 파일 생성
+        File photoFile = createCaptureFile(this.encodingType, System.currentTimeMillis() + "");
+        OutputStream os = null;
+
+        try {
+            // -------------------------------------------------
+            // 2) 1차 시도: FileOutputStream (정석)
+            // -------------------------------------------------
+            try {
+                os = new FileOutputStream(photoFile);
+                LOG.d(LOG_TAG, "Bitmap output stream opened: " + photoFile.getAbsolutePath());
+            } catch (Exception e) {
+                LOG.w(LOG_TAG, "1차 저장 실패(FileOutputStream): " + e.getMessage());
+                os = null;
+            }
+
+            // -------------------------------------------------
+            // 3) 2차 fallback: 내부 cacheDir로 우회
+            // -------------------------------------------------
+            if (os == null) {
+
+                LOG.w(LOG_TAG, "OutputStream is null. Falling back to internal cache.");
+
+                File cacheDir = cordova.getActivity().getCacheDir();
+
+                String ext = (this.encodingType == JPEG) ? ".jpg" : ".png";
+                String fallbackName = "fallback_" + System.currentTimeMillis() + ext;
+
+                File fallbackFile = new File(cacheDir, fallbackName);
+
+                os = new FileOutputStream(fallbackFile);
+
+                // fallback 성공 시 파일 교체
+                photoFile = fallbackFile;
+
+                LOG.d(LOG_TAG, "Fallback stream opened successfully: " + fallbackFile.getAbsolutePath());
+            }
+
+            // -------------------------------------------------
+            // 4) Bitmap compress 저장
+            // -------------------------------------------------
+            CompressFormat compressFormat =
+                    getCompressFormatForEncodingType(this.encodingType);
+
+            boolean ok = bitmap.compress(compressFormat, this.mQuality, os);
+
+            if (!ok) {
+                LOG.e(LOG_TAG, "Bitmap compress returned false.");
+                this.failPicture("Bitmap compress failed.");
+                return;
+            }
+
+        } catch (Exception e) {
+
+            LOG.e(LOG_TAG, "Bitmap 저장 중 예외 발생", e);
+            logreport(e);
+            this.failPicture("Failed to save bitmap: " + e.getMessage());
+            return;
+
+        } finally {
+
+            // -------------------------------------------------
+            // 5) Stream close 안전 처리
+            // -------------------------------------------------
+            try {
+                if (os != null) os.close();
+            } catch (Exception ignore) {
+            }
         }
-        else if (destType == FILE_URI) {
-            // 변환된 비트맵을 압축하여 임시 파일로 저장
-            Uri uri = Uri.fromFile(createCaptureFile(this.encodingType, System.currentTimeMillis() + ""));
-            OutputStream os = this.cordova.getActivity().getContentResolver().openOutputStream(uri);
-            CompressFormat compressFormat = getCompressFormatForEncodingType(encodingType);
 
-            bitmap.compress(compressFormat, this.mQuality, os);
-            os.close();
+        // -------------------------------------------------
+        // 6) Exif 복원 (JPEG만)
+        // -------------------------------------------------
+        if (this.encodingType == JPEG) {
 
-            // Exif 데이터 복원 (JPEG인 경우)
-            if (this.encodingType == JPEG) {
-                String exifPath = uri.getPath();
-                // GetScaledAndRotatedBitmapFromUri에서 이미 이미지를 물리적으로 회전시켰으므로,
-                // Exif의 Orientation 태그는 'Normal(1)'로 초기화해야 중복 회전이 안 됨
+            try {
+                String exifPath = photoFile.getAbsolutePath();
+
                 if (rotate != ExifInterface.ORIENTATION_NORMAL) {
                     exif.resetOrientation();
                 }
+
                 exif.createOutFile(exifPath);
                 exif.writeExifData();
-            }
 
-            this.callbackContext.success(uri.toString());
+                LOG.d(LOG_TAG, "Exif restored successfully: " + exifPath);
+
+            } catch (Exception e) {
+                LOG.w(LOG_TAG, "Exif restore failed: " + e.getMessage());
+            }
         }
 
-        // 8. 리소스 정리
-        this.cleanup(this.imageUri, galleryUri, bitmap);
+        // -------------------------------------------------
+        // 7) 최종 반환 URI는 FileProvider로 (Android 10+ 안전)
+        // -------------------------------------------------
+
+        Uri finalFileUri = FileProvider.getUriForFile(
+                cordova.getActivity(),
+                cordova.getActivity().getPackageName() + ".cordova.plugin.camera.provider",
+                photoFile
+        );
+
+        this.callbackContext.success(finalFileUri.toString());
+        
+        
     }
 
+    // =========================================================================
+    // 6단계: Cleanup
+    // =========================================================================
+    // [지적 3 반영] bitmap.recycle() 제거 (GC에 위임)
+    // [지적 5 반영] cleanup에 bitmap 전달하지 않음 (null 전달)
+    
+    // 원본 임시 파일만 정리 시도
+    this.cleanup(this.imageUri, galleryUri, null);
+}  
+    
 
-    private void writeTakenPictureToGalleryLowerThanAndroidQ(Uri galleryUri) throws IOException {
-        writeUncompressedImage(imageUri, galleryUri);
-        refreshGallery(galleryUri);
-    }
 
-    private void writeTakenPictureToGalleryStartingFromAndroidQ(GalleryPathVO galleryPathVO) throws IOException {
-        // Starting from Android Q, working with the ACTION_MEDIA_SCANNER_SCAN_FILE intent is deprecated
-        // https://developer.android.com/reference/android/content/Intent#ACTION_MEDIA_SCANNER_SCAN_FILE
-        // we must start working with the MediaStore from Android Q on.
-        ContentResolver resolver = this.cordova.getActivity().getContentResolver();
-        ContentValues contentValues = new ContentValues();
-        contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, galleryPathVO.getGalleryFileName());
-        contentValues.put(MediaStore.MediaColumns.MIME_TYPE, getMimetypeForEncodingType());
-        Uri galleryOutputUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues);
-
-        InputStream fileStream = org.apache.cordova.camera.FileHelper.getInputStreamFromUriString(imageUri.toString(), cordova);
-        writeUncompressedImage(fileStream, galleryOutputUri);
-    }
 
     private CompressFormat getCompressFormatForEncodingType(int encodingType) {
         return encodingType == JPEG ? CompressFormat.JPEG : CompressFormat.PNG;
     }
 
-    private GalleryPathVO getPicturesPath() {
-        String timeStamp = new SimpleDateFormat(TIME_FORMAT).format(new Date());
-        String imageFileName = "IMG_" + timeStamp + getExtensionForEncodingType();
-        File storageDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
-        storageDir.mkdirs();
-        return new GalleryPathVO(storageDir.getAbsolutePath(), imageFileName);
-    }
 
-    private void refreshGallery(Uri contentUri) {
-        Intent mediaScanIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
-        // Starting from Android Q, working with the ACTION_MEDIA_SCANNER_SCAN_FILE intent is deprecated
-        mediaScanIntent.setData(contentUri);
-        this.cordova.getActivity().sendBroadcast(mediaScanIntent);
-    }
 
     /**
      * Converts output image format int value to string value of mime type.
@@ -688,34 +989,91 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         return "";
     }
 
+private String outputModifiedBitmap(Bitmap bitmap, Uri uri, String mimeTypeOfOriginalFile)
+        throws IOException {
 
-    private String outputModifiedBitmap(Bitmap bitmap, Uri uri, String mimeTypeOfOriginalFile) throws IOException {
-        // Some content: URIs do not map to file paths (e.g. picasa).
-        String realPath = FileHelper.getRealPath(uri, this.cordova);
-        String fileName = calculateModifiedBitmapOutputFileName(mimeTypeOfOriginalFile, realPath);
+    // 1. 경로 계산
+    String realPath = FileHelper.getRealPath(uri, this.cordova);
+    String fileName = calculateModifiedBitmapOutputFileName(mimeTypeOfOriginalFile, realPath);
 
-        String modifiedPath = getTempDirectoryPath() + "/" + fileName;
+    File cacheDir = new File(getTempDirectoryPath());
 
-        OutputStream os = new FileOutputStream(modifiedPath);
-        CompressFormat compressFormat = getCompressFormatForEncodingType(this.encodingType);
+    // 2. Temp 디렉토리 보장 (mkdirs 실패 체크 포함)
+    if (!cacheDir.exists()) {
+        boolean created = cacheDir.mkdirs();
+        if (!created) {
+            throw new IOException("Failed to create temp directory: " + cacheDir.getAbsolutePath());
+        }
+    }
 
-        bitmap.compress(compressFormat, this.mQuality, os);
-        os.close();
+    File destFile = new File(cacheDir, fileName);
+    String modifiedPath = destFile.getAbsolutePath();
 
-        if (exifData != null && this.encodingType == JPEG) {
-            try {
-                if (this.correctOrientation && this.orientationCorrected) {
-                    exifData.resetOrientation();
-                }
-                exifData.createOutFile(modifiedPath);
-                exifData.writeExifData();
-                exifData = null;
-            } catch (IOException e) {
-                e.printStackTrace();
+    CompressFormat compressFormat =
+            getCompressFormatForEncodingType(this.encodingType);
+
+    // 3. Bitmap 저장 (try-with-resources로 완전 안전)
+    try (OutputStream os =
+                 new BufferedOutputStream(new FileOutputStream(destFile))) {
+
+        boolean success = bitmap.compress(compressFormat, this.mQuality, os);
+
+        // flush는 close 전에 명시적으로 수행
+        os.flush();
+
+        if (!success) {
+            throw new IOException("Bitmap.compress() returned false: " + modifiedPath);
+        }
+
+    } catch (IOException e) {
+
+        // 실패 시 찌꺼기 파일 삭제 시도
+        if (destFile.exists()) {
+            boolean deleted = destFile.delete();
+            if (!deleted) {
+                LOG.w(LOG_TAG, "Failed to delete broken output file: " + modifiedPath);
             }
         }
-        return modifiedPath;
+
+        throw e; // 상위 Retry/Fallback 로직으로 전달
     }
+
+    // 4. 파일 크기 sanity check (compress 성공해도 0 byte 방지)
+    long fileSize = destFile.length();
+    if (fileSize < 100) { // 최소 크기 기준 (너무 작으면 비정상)
+        boolean deleted = destFile.delete();
+        LOG.w(LOG_TAG,
+                "Compressed file too small (" + fileSize + " bytes). Deleted=" + deleted);
+
+        throw new IOException("Output file is invalid (too small): " + modifiedPath);
+    }
+
+    // 5. Exif 복사 (파일이 정상 생성된 경우에만 수행)
+    if (exifData != null && this.encodingType == JPEG) {
+        try {
+            if (this.correctOrientation && this.orientationCorrected) {
+                exifData.resetOrientation();
+            }
+
+            exifData.createOutFile(modifiedPath);
+            exifData.writeExifData();
+
+        } catch (IOException exifError) {
+
+            // Exif 실패는 치명적이지 않으므로 경고만 남김
+            LOG.w(LOG_TAG,
+                    "Failed to preserve Exif metadata: " + exifError.getMessage());
+
+        } finally {
+            // 상황에 따라 메모리 정리 가능
+            // exifData = null;
+        }
+    }
+
+    return modifiedPath;
+}
+
+
 
     private String calculateModifiedBitmapOutputFileName(String mimeTypeOfOriginalFile, String realPath) {
         if (realPath == null) {
@@ -741,256 +1099,689 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
      * @param destType In which form should we return the image
      * @param intent   An Intent, which can return result data to the caller (various data can be attached to Intent "extras").
      */
+
+private void safeSleep(int ms) {
+    try {
+        Thread.sleep(ms);
+    } catch (InterruptedException ignored) {}
+}
      
-    private void processResultFromGallery(int destType, Intent intent) {
-        // final 캡처
-        final int finalDestType = destType;
-        final Intent finalIntent = intent;
+private void processResultFromGallery(int destType, Intent intent) {
+    // 1. ThreadPool을 사용해 즉시 백그라운드 작업으로 넘깁니다.
+    cordova.getThreadPool().execute(() -> {
+        this.releaseMemory();
+        safeSleep(300); 
+        try {
+            processResultFromGallery_ex(destType, intent);
+        } catch (Throwable t) {
+            // Throwable로 OOM까지 완벽히 방어합니다.
+            LOG.e(LOG_TAG, "Final failure", t);
 
-        // 1. UI 스레드에서 지연(Delay) 처리
-        new android.os.Handler(android.os.Looper.getMainLooper())
-                .postDelayed(() -> {
-                    // 2. 지연 시간이 끝난 후, 무거운 작업은 다시 백그라운드 스레드풀로 전달해야 함 (중요!)
-                    cordova.getThreadPool().execute(() -> {
+            Activity act = cordova.getActivity();
+            if (act != null && !act.isFinishing()) {
+                act.runOnUiThread(() ->
+                   CameraLauncher.this.failPicture("Error processing gallery image: " + t.getLocalizedMessage())
+                );
+            }
+            logreport(t);
+        }
+    });
+}
 
-                        //System.gc();
-                        //System.runFinalization();
-                        
-                        processResultFromGallery_ex(finalDestType, finalIntent);
-                    });
-                }, 50);
-    }    
-    
-    private void processResultFromGallery_ex(int destType, Intent intent) {
-        Uri uri = intent.getData();
-        if (uri == null) {
-            if (croppedUri != null) {
-                uri = croppedUri;
-            } else {
-                this.failPicture("null data from photo library");
-                return;
+private boolean waitForFileStable(File f, long timeoutMs) {
+    long start = System.currentTimeMillis();
+    long lastSize = -1;
+
+    while (System.currentTimeMillis() - start < timeoutMs) {
+        long size = f.length();
+        if (size > 0 && size == lastSize) return true;
+        lastSize = size;
+        try { Thread.sleep(100); } catch (Exception ignored) {}
+    }
+    return false;
+}
+
+
+
+
+
+// 내부 클래스 (변경 없음)
+private static class CopyResult {
+    Uri uri;
+    String mime;
+}
+
+/**
+ * Google Photos 등의 원격 이미지를 로컬 캐시로 안전하게 복사
+ */
+private CopyResult safeCopyGooglePhotosToCache(ContentResolver resolver, Uri uri, File cacheDir) throws IOException {
+
+    CopyResult result = new CopyResult();
+
+    // safeCopy 내부 1번 항목 수정 제안
+    String mime = resolver.getType(uri);
+    if (mime == null || mime.isEmpty() || mime.equals("*/*")) {
+        mime = FileHelper.getMimeType(uri.toString(), this.cordova); // 기존 헬퍼 활용
+    }
+    if (mime == null) mime = "image/jpeg"; // 최종 fallback
+
+
+    // 2. 확장자 결정
+    String ext = ".jpg";
+    try {
+        String dExt = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mime);
+        if (dExt != null) ext = "." + dExt;
+    } catch (Exception e) {
+        // MimeTypeMap 에러 시 기본 .jpg 유지
+    }
+
+    File tempFile = new File(cacheDir, "gp_" + System.currentTimeMillis() + "_cached" + ext);
+
+    try (InputStream in = resolver.openInputStream(uri);
+         FileOutputStream out = new FileOutputStream(tempFile)) {
+
+        if (in == null) throw new IOException("InputStream is null");
+
+        byte[] buf = new byte[8192];
+        int len;
+        
+        long total = 0;
+        long maxSize = 50 * 1024 * 1024;
+
+        while ((len = in.read(buf)) != -1) {
+            out.write(buf, 0, len);
+            total += len;
+
+            if (total > maxSize) {
+                throw new IOException("File too large or stream stuck");
             }
         }
+        
+        
+        out.flush();
+    } catch (IOException e) {
+        // 복사 중 에러 발생 시 불완전한 파일 삭제
+        if (tempFile.exists()) tempFile.delete();
+        throw e;
+    }
 
-        String uriString = uri.toString();
-        String mimeTypeOfGalleryFile = FileHelper.getMimeType(uriString, this.cordova);
+    // 파일 사이즈 검증 (100바이트 미만 등 비정상 파일 필터링)
+    if (tempFile.length() < 100) { 
+        tempFile.delete(); 
+        throw new IOException("File transfer incomplete (too small)");
+    }
 
-        // WHRIA
-        // ===== HEIC / HEIF → JPEG native convert =====
-        boolean isHeic = false;
+    Activity act = cordova.getActivity();
+    if (act == null || act.isFinishing()) {
+        if (tempFile.exists()) tempFile.delete();
+        throw new IOException("Activity lost during copy");
+    }
 
-        // 1) MIME 기준
-        if (mimeTypeOfGalleryFile != null) {
-            String m = mimeTypeOfGalleryFile.toLowerCase();
-            if (m.equals("image/heic") || m.equals("image/heif")) {
+    // 권한 확인 (Authority 매칭 확인 필수)
+    String authority = act.getPackageName() + ".cordova.plugin.camera.provider";
+    result.uri = FileProvider.getUriForFile(act, authority, tempFile);
+    result.mime = mime;
+
+    return result;
+}
+
+
+private void processResultFromGallery_ex(int destType, Intent intent) {
+
+    // 1. 유효성 검사
+    if (cordova.getActivity() == null || cordova.getActivity().isFinishing()) return;
+
+    Uri uri = intent.getData();
+    if (uri == null && intent.getClipData() != null) {
+        uri = intent.getClipData().getItemAt(0).getUri();
+    }
+    if (uri == null) {
+        logreport("No Uri returned from gallery");
+       this.failPicture("No Uri returned from gallery");
+        return;
+    }
+
+    String uriString = uri.toString();
+    Uri originalUri = uri;
+    ContentResolver resolver = cordova.getActivity().getContentResolver();
+
+    // 2. MIME Type 확인 (한 번만 수행하여 계속 재사용)
+    String mimeType = resolver.getType(uri);
+    if (mimeType == null) mimeType = FileHelper.getMimeType(uriString, this.cordova);
+
+    // 3. 복사 필요 여부 확인
+    File cacheDir = cordova.getActivity().getCacheDir();
+    String scheme = uri.getScheme();
+
+
+    boolean isGooglePhotos =
+            uri.getAuthority() != null &&
+            uri.getAuthority().startsWith("com.google.android.apps.photos");
+
+    Uri cachedUri = null;
+    if (isGooglePhotos) {
+        LOG.w(LOG_TAG, "Google Photos URI detected → using SAFE copy to cache");
+
+        try {
+            CopyResult copy = safeCopyGooglePhotosToCache(resolver, uri, cacheDir);
+
+            cachedUri = copy.uri;
+            uri = cachedUri;
+        
+            mimeType = copy.mime;
+            uriString = uri.toString();
+            scheme = uri.getScheme();
+            
+            // ✅ 이제 Google Photos 아님
+            isGooglePhotos = false;
+
+
+        } catch (Exception e) {
+            LOG.e(LOG_TAG, "Google Photos SAFE copy failed → fallback original", e);
+            logreport(e);
+
+            // fallback
+            uri = originalUri;
+            uriString = originalUri.toString();
+        }
+    }
+
+
+    boolean isInternal = "file".equalsIgnoreCase(scheme) && uri.getPath() != null && uri.getPath().startsWith(cacheDir.getAbsolutePath());
+    //boolean needCopy = !isInternal; // content://, http://, 외부 file:// 모두 복사 대상
+    boolean isMediaStore =
+            uriString.startsWith("content://media/");
+    boolean needCopy = !isInternal
+            && !isGooglePhotos;
+    //        && !isMediaStore;
+    if (uri.getAuthority() != null &&
+        uri.getAuthority().equals(cordova.getActivity().getPackageName() + ".cordova.plugin.camera.provider")) {
+        needCopy = false;
+    }
+    
+
+    if (needCopy) {
+        LOG.d(LOG_TAG, "Copying external resource to local cache...");
+
+        String ext = ".jpg";
+        if (mimeType != null) {
+            String dExt = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
+            if (dExt != null) ext = "." + dExt;
+        }
+
+        File tempFile = new File(cacheDir, System.currentTimeMillis() + "_cached" + ext);
+
+        try {
+            // [Standard Copy] 블로킹 I/O (완료될 때까지 대기함)
+            copyUriToFile(resolver, uri, tempFile);
+
+            // 복사 성공 시 URI 교체
+            uri = FileProvider.getUriForFile(cordova.getActivity(), cordova.getActivity().getPackageName() + ".cordova.plugin.camera.provider", tempFile);
+            uriString = uri.toString();
+
+            String newMime = resolver.getType(uri);
+
+            if (newMime == null) {
+                newMime = URLConnection.guessContentTypeFromName(tempFile.getName());
+            }
+            if (newMime != null) mimeType = newMime;
+            
+        
+        } catch (Exception e) {
+            // [Log Check] 복사 실패는 치명적이지 않음(Fallback함) -> 그래도 로그는 남김
+            LOG.w(LOG_TAG, "Copy failed (" + e.getMessage() + "), using original URI.");
+            logreport(e); // 에러 리포트 전송
+            
+            uri = originalUri;
+            uriString = originalUri.toString();
+        }
+    }
+
+    // =========================================================================
+    // [FIX 2] HEIC 판별 (위에서 구한 mimeType 재사용)
+    // =========================================================================
+    boolean isHeic = false;
+
+    if (mimeType != null) {
+
+        String m = mimeType.toLowerCase();
+        isHeic = m.contains("heic") || m.contains("heif");
+        
+    }
+
+    if (!isHeic) {
+        String name = getFileNameFromUri(uri);
+        if (name != null) {
+            String lower = name.toLowerCase();
+            if (lower.endsWith(".heic") || lower.endsWith(".heif")) {
                 isHeic = true;
             }
         }
-
-        // 2) MIME이 부정확할 경우 확장자 fallback
-        if (!isHeic) {
-            String path = FileHelper.getRealPath(uri, this.cordova);
-            if (path != null) {
-                String p = path.toLowerCase();
-                if (p.endsWith(".heic") || p.endsWith(".heif")) {
-                    isHeic = true;
-                }
-            }
-        }
-
-        if (isHeic) {
-            final Uri finalUri = uri;
-
-            cordova.getThreadPool().execute(() -> {
-                // [추가됨] 1. 첫 시도 전 50ms 대기
-                try {
-                    Thread.sleep(50);
-                } catch (InterruptedException e) {
-                    // 무시
-                }
-
-                // 첫 번째 시도
-                try {
-                    String jpegPath = convertHeicToJpeg(finalUri);
-                    callbackContext.success(jpegPath);
-                    return; // 성공하면 여기서 종료
-                } catch (Throwable t) {
-                    // 첫 시도 실패 시 로그만 남기고 재시도 단계로 진행
-                    // (Throwable을 사용하여 Exception과 OutOfMemoryError를 모두 잡음)
-                    LOG.w(LOG_TAG, "First HEIC conversion attempt failed. Retrying in 100ms...", t);
-                }
-
-                // [추가됨] 2. 100ms 대기 (재시도 전)
-                try {
-                    Thread.sleep(100);
-                } catch (InterruptedException e) {
-                    // 무시
-                }
-
-                // 3. 재시도 (최종)
-                try {
-                    String jpegPath = convertHeicToJpeg(finalUri);
-                    callbackContext.success(jpegPath);
-                } catch (OutOfMemoryError oom) {
-                    // 재시도에서도 메모리 부족 발생 시 에러 리턴
-                    LOG.e(LOG_TAG, "OOM converting HEIC (Retry)", oom);
-                    callbackContext.error("Out of memory");
-                } catch (Exception e) {
-                    // 재시도에서도 일반 예외 발생 시 에러 리턴
-                    LOG.e(LOG_TAG, "Error converting HEIC (Retry)", e);
-                    callbackContext.error(e.getMessage());
-                }
-            });
-            return;
-        }
-        
-        
-        // WHRIA: 일반 이미지(JPG/PNG) 처리 로직 개선 (OOM 방지)
-        // 기존의 readData(byte[]) 방식을 제거하고 InputStream을 사용
-
-        // 0. 아무 변환이 필요 없는 경우 빠른 리턴 (메모리 로딩 전 체크)
-        if (this.targetHeight == -1 && this.targetWidth == -1 &&
-            destType == FILE_URI && !this.correctOrientation &&
-            getMimetypeForEncodingType().equalsIgnoreCase(mimeTypeOfGalleryFile)) {
-            this.callbackContext.success(uriString);
-            return;
-        }
-        
-        // 1. Exif 데이터 보존을 위해 ExifHelper 초기화 (JPEG인 경우)
-        // 주의: GetScaledAndRotatedBitmapFromUri 호출 전에 미리 읽어둬야 함
-        if (this.encodingType == JPEG) {
-            InputStream exifInput = null;
-            try {
-                exifInput = cordova.getActivity().getContentResolver().openInputStream(uri);
-                exifData = new ExifHelper();
-                exifData.createInFile(exifInput); 
-                exifData.readExifData();
-            } catch (Exception e) {
-                LOG.w(LOG_TAG, "Failed to read Exif data from Uri", e);
-            }
-            // exifInput은 ExifHelper 내부 동작에 따라 닫힐 수 있으나, 안전을 위해 여기서 별도 close는 하지 않음(기존 로직 참조)
-            // 다만, createInFile(InputStream) 구현체에 따라 스트림 소모 여부가 다르므로,
-            // 아래 비트맵 디코딩에서는 '새로운' InputStream을 엽니다.
-        }
-
-        Bitmap bitmap = null;
-
-        // [추가됨] 1. 첫 시도 전 50ms 대기
-        try {
-            Thread.sleep(50);
-        } catch (InterruptedException e) {
-            // InterruptedException 무시
-        }
-
-        try {
-            // [개선된 로직] byte[] 로딩 없이 스트림에서 바로 디코딩 및 회전
-            bitmap = GetScaledAndRotatedBitmapFromUri(uri);
-        } catch (OutOfMemoryError e) {
-            // 메모리 부족 발생 시 명시적으로 에러 처리
-            LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromGallery", e);
-            this.failPicture("Out of memory while loading image.");
-            return; // 더 이상 진행하지 않고 종료
-        } catch (Exception e) {
-            // IOException 및 기타 예외 처리
-            LOG.e(LOG_TAG, "Error loading image", e);
-            this.failPicture("Error retrieving image: " + e.getLocalizedMessage());
-            return;
-        }
-
-        // [추가됨] 2. bitmap이 null이면 100ms 대기 후 재시도
-        if (bitmap == null) {
-            try {
-                LOG.d(LOG_TAG, "Bitmap is null. Waiting 100ms to retry...");
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                // InterruptedException 무시
-            }
-
-            try {
-                // 재시도
-                bitmap = GetScaledAndRotatedBitmapFromUri(uri);
-            } catch (OutOfMemoryError e) {
-                LOG.e(LOG_TAG, "OutOfMemoryError in processResultFromGallery (Retry)", e);
-                this.failPicture("Out of memory while loading image.");
-                return;
-            } catch (Exception e) {
-                LOG.e(LOG_TAG, "Error loading image (Retry)", e);
-                this.failPicture("Error retrieving image: " + e.getLocalizedMessage());
-                return;
-            }
-
-            // 3. 재시도 후에도 여전히 null이면 최종 실패 처리
-            if (bitmap == null) {
-                LOG.d(LOG_TAG, "I either have an unreadable uri or null bitmap");
-                this.failPicture("Unable to create bitmap!");
-                return;
-            }
-        }
-        
-        // If sending base64 image back
-        if (destType == DATA_URL) {
-            this.processPicture(bitmap, this.encodingType);
-        }
-
-        // If sending filename back
-        else if (destType == FILE_URI) {
-            // Did we modify the image?
-            // (위에서 이미 체크했지만, bitmap 로드 후 확실한 처리를 위해)
-            if ( (this.targetHeight > 0 && this.targetWidth > 0) ||
-                    (this.correctOrientation && this.orientationCorrected) ||
-                    !mimeTypeOfGalleryFile.equalsIgnoreCase(getMimetypeForEncodingType()))
-            {
-                try {
-                    String modifiedPath = this.outputModifiedBitmap(bitmap, uri, mimeTypeOfGalleryFile);
-                    // The modified image is cached by the app in order to get around this and not have to delete you
-                    // application cache I'm adding the current system time to the end of the file url.
-                    this.callbackContext.success("file://" + modifiedPath + "?" + System.currentTimeMillis());
-
-                } catch (Exception e) {
-                    e.printStackTrace();
-                    this.failPicture("Error retrieving image: "+e.getLocalizedMessage());
-                }
-            } else {
-                this.callbackContext.success(uriString);
-            }
-        }
-        
-        if (bitmap != null) {
-            bitmap.recycle();
-            bitmap = null;
-        }
-        System.gc();
     }
 
-    /**
-     * [New Method] Uri로부터 InputStream을 이용해 메모리 효율적으로 비트맵을 로드하고 회전
-     */
-private Bitmap GetScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
-    ContentResolver resolver = this.cordova.getActivity().getContentResolver();
+
+    if (isHeic) {
+        // 원래 해상도 저장
+        final int origW = this.targetWidth;
+        final int origH = this.targetHeight;
+
+        try {
+            try {
+                // 1차 변환 시도
+                String jpegPath = convertHeicToJpeg(uri);
+                safeSuccess(jpegPath);
+                return;
+
+            } catch (Throwable firstError) { // Exception과 Error(OOM 포함) 모두 캐치
+                LOG.w(LOG_TAG, "HEIC 1st convert failed (OOM or Exception) → retry with 900x900", firstError);
+
+                // 메모리 정리 + delay (OOM 발생 직후이므로 매우 중요)
+                this.releaseMemory();
+                safeSleep(500);
+
+                // retry용 해상도 제한
+                this.targetWidth  = Math.min(origW, 900);
+                this.targetHeight = Math.min(origH, 900);
+
+                try {
+                    // 2차 변환 시도
+                    String jpegPath = convertHeicToJpeg(uri);
+                    safeSuccess(jpegPath);
+                    return;
+
+                } catch (Throwable secondError) {
+                    LOG.e(LOG_TAG, "HEIC convert retry failed again", secondError);
+
+                    String errorMsg = (secondError instanceof OutOfMemoryError) 
+                                      ? "Memory limit exceeded during HEIC conversion" 
+                                      : secondError.getMessage();
+                    
+                   this.failPicture("Error converting HEIC: " + errorMsg);
+                    logreport(secondError);
+                    return;
+                }
+            }
+        } finally {
+            // ⭐ 반드시 원복
+            this.targetWidth = origW;
+            this.targetHeight = origH;
+        }
+    }    
+    
+    // 0. 변환 불필요 시 빠른 리턴 (Exif 읽기 전에 수행하여 성능 최적화)
+    if (this.targetHeight == -1 && this.targetWidth == -1 &&
+        destType == FILE_URI && !this.correctOrientation &&
+        getMimetypeForEncodingType().equalsIgnoreCase(mimeType)) {
+        safeSuccess(uriString);
+        return;
+    }
+
+    // Exif 읽기
+    if (!isGooglePhotos && this.encodingType == JPEG && this.exifData == null) {
+        try (InputStream exifInput = resolver.openInputStream(uri)) {
+            if (exifInput != null) {
+                this.exifData = new ExifHelper();
+                this.exifData.createInFile(exifInput); 
+                this.exifData.readExifData();
+            }
+        } catch (Exception e) {
+            LOG.w(LOG_TAG, "Failed to read Exif data", e);
+            // Exif 실패는 logreport까지 할 필요는 없음 (선택사항)
+        }
+    }
+
+    Bitmap bitmap = null;
+
+    /** 1차 시도 (현재 uri: cachedUri or normal uri) */
+    try {
+        bitmap = GetScaledAndRotatedBitmapFromUri(uri);
+    } catch (Exception e) {
+        LOG.w(LOG_TAG, "Decode failed (1st)", e);
+    }
+
+    /** ✅ cachedUri였다면 → originalUri로 fallback */
+    if (bitmap == null && cachedUri != null) {
+
+        LOG.w(LOG_TAG, "Cache decode failed → retry original URI");
+
+        uri = originalUri;
+        uriString = uri.toString();
+
+        try {
+            bitmap = GetScaledAndRotatedBitmapFromUri(uri);
+        } catch (Exception e) {
+            LOG.e(LOG_TAG, "Original decode retry failed", e);
+        }
+    }
+
+    /** 마지막 실패 처리 */
+    if (bitmap == null) {
+        logreport("Unable to create bitmap!");
+       this.failPicture("Unable to create bitmap!");
+        return;
+    }
+
+
+    // 결과 처리
+    if (destType == DATA_URL) {
+        this.processPicture(bitmap, this.encodingType);
+    } else if (destType == FILE_URI) {
+        try {
+            // [1차 시도]
+            String modifiedPath = this.outputModifiedBitmap(bitmap, uri, mimeType);
+            //this.callbackContext.success("file://" + modifiedPath + "?" + System.currentTimeMillis());
+            safeSuccess("file://" + modifiedPath + "?" + System.currentTimeMillis());
+
+        } catch (Exception e) {
+            // [1차 실패] -> 300ms 대기 후 딱 한 번만 재시도
+            try {
+                safeSleep(300);
+                // [2차 시도]
+                String modifiedPath = this.outputModifiedBitmap(bitmap, uri, mimeType);
+                safeSuccess("file://" + modifiedPath + "?" + System.currentTimeMillis());
+
+            } catch (Exception finalEx) {
+                // [2차 실패] -> 이제 진짜 에러 처리
+                logreport(finalEx); 
+                this.failPicture("Error retrieving image: " + finalEx.getLocalizedMessage());
+            }
+        }        
+        
+    }
+
+    if (bitmap != null) {
+        bitmap.recycle();
+    }
+        
+}
+
+
+
+
+/*
+private void safeSuccess(final String msg) {
+
+    final CallbackContext cb = callbackContext;
+    if (cb == null) return;
+    if (cb.isFinished()) return;
+
+    Activity act = cordova.getActivity();
+    if (act != null) {
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    cb.success(msg);
+                } catch (Throwable ignore) {}
+            }
+        });
+    } else {
+        try {
+            cb.success(msg);
+        } catch (Throwable ignore) {}
+    }
+}
+*/
+
+private void safeSuccess(final String msg) {
+if (this.callbackContext!=null)
+this.callbackContext.success(msg);
+}
+
+
+
+/**
+ * 캐시 디렉토리 내의 오래된 gp_ 임시 파일들을 삭제합니다.
+ */
+private void cleanupOldGooglePhotosQuirkFiles() {
+    try {
+        File cacheDir = this.cordova.getActivity().getCacheDir();
+        File[] files = cacheDir.listFiles();
+        if (files == null) return;
+
+        long now = System.currentTimeMillis();
+        // 생성된 지 24시간 이상 된 파일은 삭제 (안전한 처리를 위해)
+        long expirationThreshold = 24 * 60 * 60 * 1000; 
+
+        for (File file : files) {
+            String name = file.getName();
+            if (name.startsWith("gp_") && name.contains("_cached")) {
+                // 1. 오래된 파일이거나 2. 현재 작업 중이 아닐 것으로 판단되는 파일 삭제
+                if ((now - file.lastModified()) > expirationThreshold) {
+                    if (file.delete()) {
+                        LOG.d(LOG_TAG, "Deleted old gp cache file: " + name);
+                    }
+                }
+            }
+        }
+    } catch (Exception e) {
+        LOG.w(LOG_TAG, "Error cleaning up gp cache files", e);
+    }
+}
+
+
+
+
+
+
+
+// [Helper] 표준 파일 복사 함수
+private void copyUriToFile(ContentResolver resolver, Uri srcUri, File dstFile) throws IOException {
+    try (InputStream in = resolver.openInputStream(srcUri);
+         OutputStream out = new FileOutputStream(dstFile)) {
+        
+        if (in == null) throw new IOException("Source stream is null");
+
+        byte[] buffer = new byte[8192];
+        int bytesRead;
+        while ((bytesRead = in.read(buffer)) != -1) {
+            out.write(buffer, 0, bytesRead);
+        }
+        out.flush();
+    }
+}
+
+private String getFileNameFromUri(Uri uri) {
+
+    if (uri == null) return null;
+
+    ContentResolver resolver = cordova.getActivity().getContentResolver();
+
+    // =========================================================
+    // 1) content:// URI → query DISPLAY_NAME
+    // =========================================================
+    if ("content".equalsIgnoreCase(uri.getScheme())) {
+
+        Cursor cursor = null;
+        try {
+            cursor = resolver.query(
+                    uri,
+                    new String[]{OpenableColumns.DISPLAY_NAME},
+                    null,
+                    null,
+                    null
+            );
+
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index != -1) {
+                    String name = cursor.getString(index);
+                    if (name != null && !name.trim().isEmpty()) {
+                        return name;
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            LOG.w(LOG_TAG, "getFileNameFromUri query failed: " + e.getMessage());
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+    }
+
+    // =========================================================
+    // 2) file:// URI → path 기반 추출
+    // =========================================================
+    if ("file".equalsIgnoreCase(uri.getScheme())) {
+        String path = uri.getPath();
+        if (path != null) {
+            return new File(path).getName();
+        }
+    }
+
+    // =========================================================
+    // 3) 마지막 fallback → URI string에서 추출
+    // =========================================================
+    try {
+        String last = uri.getLastPathSegment();
+        if (last != null && last.contains(".")) {
+            return last;
+        }
+    } catch (Exception ignored) {}
+
+    return null;
+}
+
+
+
+
+
+private boolean waitForUriReady(ContentResolver resolver, Uri uri) {
+
+    long start = System.currentTimeMillis();
+    long timeoutMs = 4000;
+
+    long lastSize = -1;
+    int stableCount = 0;
+
+    // ✅ FileNotFound 연속 발생 감지
+    int fileNotFoundCount = 0;
+    final int MAX_NOTFOUND = 2; // 2번이면 바로 종료
 
     BitmapFactory.Options opts = new BitmapFactory.Options();
     opts.inJustDecodeBounds = true;
 
-    // 1️⃣ bounds
-    try (InputStream is = resolver.openInputStream(uri)) {
-        if (is == null) return null;
-        BitmapFactory.decodeStream(is, null, opts);
+    while (System.currentTimeMillis() - start < timeoutMs) {
+
+        try (ParcelFileDescriptor pfd =
+                     resolver.openFileDescriptor(uri, "r")) {
+
+            // 성공했으면 FileNotFound 카운트 reset
+            fileNotFoundCount = 0;
+
+            if (pfd == null) {
+                continue;
+            }
+
+            long currentSize = pfd.getStatSize();
+
+            if (currentSize <= 0) {
+                continue;
+            }
+
+            // ===============================
+            // 1) 파일 크기 stable 2회 연속 확인
+            // ===============================
+            if (currentSize == lastSize) {
+                stableCount++;
+            } else {
+                stableCount = 0;
+            }
+
+            lastSize = currentSize;
+
+            if (stableCount >= 2) {
+
+                FileDescriptor fd = pfd.getFileDescriptor();
+
+                // opts reset
+                opts.outWidth = 0;
+                opts.outHeight = 0;
+
+                BitmapFactory.decodeFileDescriptor(fd, null, opts);
+
+                if (opts.outWidth > 0 && opts.outHeight > 0) {
+                    return true; // ✅ Ready
+                }
+            }
+
+        }
+        catch (FileNotFoundException fnf) {
+
+            fileNotFoundCount++;
+
+            LOG.w(LOG_TAG,
+                    "waitForUriReady FileNotFound (" +
+                    fileNotFoundCount + "): " + uri);
+
+            /*
+            // ✅ 권한 문제는 기다려도 소용없음 → 빠른 종료
+            if (fileNotFoundCount >= MAX_NOTFOUND) {
+                LOG.e(LOG_TAG,
+                        "URI not accessible, abort early: " + uri);
+                return false;
+            }
+            */
+        }
+        catch (Exception ignored) {
+            // 생성 중 lock 상태 등 → 계속 재시도
+        }
+
+        // ===============================
+        // 짧게 sleep
+        // ===============================
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException ignored) {}
     }
 
-    if (opts.outWidth <= 0 || opts.outHeight <= 0) return null;
+    LOG.w(LOG_TAG, "waitForUriReady timeout: " + uri);
+    return false;
+}
 
-    // 2️⃣ exif 먼저 읽기 (rotate 결정)
+
+
+private Bitmap GetScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
+    ContentResolver resolver = this.cordova.getActivity().getContentResolver();
+
+    // ===============================
+    // 0) 파일 준비 대기 (race 방지)
+    // ===============================
+    waitForUriReady(resolver, uri);
+    safeSleep(300);
+
+    // ===============================
+    // 1) bounds 읽기
+    // ===============================
+    BitmapFactory.Options opts = new BitmapFactory.Options();
+    opts.inJustDecodeBounds = true;
+
+    try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
+        if (pfd == null) {
+            // 수정: pfd가 null인 경우 구체적 메시지 전달
+            throw new IOException("Failed to open file descriptor (pfd is null) for URI: " + uri);
+        }
+
+        BitmapFactory.decodeFileDescriptor(
+                pfd.getFileDescriptor(),
+                null,
+                opts
+        );
+    }
+
+    if (opts.outWidth <= 0 || opts.outHeight <= 0) {
+        // 수정: 이미지 크기를 읽지 못한 경우 (파일 손상 등)
+        throw new IOException("Failed to read image bounds. The file might not be an image or is corrupted. URI: " + uri);
+    }
+
+    // ===============================
+    // 2) EXIF orientation 읽기
+    // ===============================
     int rotate = 0;
     if (this.correctOrientation) {
         try (InputStream exifStream = resolver.openInputStream(uri)) {
             if (exifStream != null) {
-                ExifInterface exif;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    exif = new ExifInterface(exifStream);
-                } else {
-                    exif = new ExifInterface(uri.getPath());
-                }
-
+                ExifInterface exif = new ExifInterface(exifStream);
                 int orientation = exif.getAttributeInt(
                         ExifInterface.TAG_ORIENTATION,
                         ExifInterface.ORIENTATION_NORMAL
@@ -1000,61 +1791,151 @@ private Bitmap GetScaledAndRotatedBitmapFromUri(Uri uri) throws IOException {
                 else if (orientation == ExifInterface.ORIENTATION_ROTATE_180) rotate = 180;
                 else if (orientation == ExifInterface.ORIENTATION_ROTATE_270) rotate = 270;
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            // EXIF 실패는 치명적이지 않으므로 로그만 남기고 진행
+            LOG.w(LOG_TAG, "Error reading EXIF data: " + e.getMessage());
+        }
     }
 
-    // 3️⃣ sample size 계산
+    boolean willRotate = (rotate != 0);
+
+    // ===============================
+    // 3) sampleSize 계산
+    // ===============================
     if (this.targetWidth > 0 && this.targetHeight > 0) {
-        opts.inSampleSize = calculateSampleSize(
+        opts.inSampleSize = calculateSampleSizeSmart(
+                this.cordova.getActivity(),
                 opts.outWidth,
                 opts.outHeight,
                 this.targetWidth,
-                this.targetHeight
+                this.targetHeight,
+                willRotate
         );
     }
 
-    // 4️⃣ 실제 decode (메모리 절감 핵심)
     opts.inJustDecodeBounds = false;
     opts.inPreferredConfig = Bitmap.Config.RGB_565;
     opts.inMutable = false;
     opts.inDither = true;
 
-    Bitmap bitmap;
-    try (InputStream is = resolver.openInputStream(uri)) {
-        bitmap = BitmapFactory.decodeStream(is, null, opts);
+    // ===============================
+    // 4) decode + retry (희귀 null 방지)
+    // ===============================
+    Bitmap bitmap = null;
+    String lastExceptionMessage = "";
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
+            if (pfd == null) continue;
+
+            boolean oomHappened = false;
+            try {
+                bitmap = BitmapFactory.decodeFileDescriptor(
+                        pfd.getFileDescriptor(),
+                        null,
+                        opts
+                );
+            } catch (OutOfMemoryError oom) {
+                lastExceptionMessage = "OutOfMemoryError at attempt " + (attempt + 1);
+                opts.inSampleSize *= 2;
+                oomHappened = true;
+            }
+            if (oomHappened) continue;
+        } catch (IOException e) {
+            lastExceptionMessage = e.getMessage();
+        }
+
+        if (bitmap != null) break;
+
+        // 실패하면 더 작게 재시도
+        opts.inSampleSize *= 2;
+        safeSleep(300);
     }
 
-    if (bitmap == null) return null;
+    if (bitmap == null) {
+        // 수정: 3번의 시도 후에도 실패한 경우 상세 정보와 함께 throw
+        throw new IOException("Failed to decode bitmap after 3 attempts. Last error: " + lastExceptionMessage + ", URI: " + uri);
+    }
 
-    // 5️⃣ rotate (최종 1회)
+    // ===============================
+    // 5) rotate (OOM 시 재시도)
+    // ===============================
     if (rotate != 0) {
         Matrix m = new Matrix();
         m.setRotate(rotate);
 
         try {
             Bitmap rotated = Bitmap.createBitmap(
-                    bitmap, 0, 0,
+                    bitmap,
+                    0,
+                    0,
                     bitmap.getWidth(),
                     bitmap.getHeight(),
                     m,
                     true
             );
+
             if (rotated != bitmap) {
                 bitmap.recycle();
                 bitmap = rotated;
             }
             this.orientationCorrected = true;
+
         } catch (OutOfMemoryError oom) {
+            // rotate 실패는 치명적이지 않으므로 원본 반환 (기존 로직 유지)
             this.orientationCorrected = false;
+            return bitmap;
         }
     }
-   
 
     return bitmap;
 }
 
 
+
+private Bitmap decodeWithRetryFD(
+        ContentResolver resolver,
+        Uri uri,
+        BitmapFactory.Options options
+) {
+
+    Bitmap bitmap = null;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+
+        try (ParcelFileDescriptor pfd =
+                     resolver.openFileDescriptor(uri, "r")) {
+
+            if (pfd == null) continue;
+
+            bitmap = BitmapFactory.decodeFileDescriptor(
+                    pfd.getFileDescriptor(),
+                    null,
+                    options
+            );
+
+        } catch (OutOfMemoryError oom) {
+            LOG.w(LOG_TAG,
+                    "OOM during decode attempt " + attempt,
+                    oom);
+
+            bitmap = null;
+        } catch (Exception ignored) {
+            bitmap = null;
+        }
+
+        if (bitmap != null) return bitmap;
+
+        // 실패하면 더 작게 재시도
+        options.inSampleSize *= 2;
+        safeSleep(200);
+    }
+
+    return null;
+}
+
 private String convertHeicToJpeg(Uri uri) throws IOException {
+
     ContentResolver resolver = cordova.getActivity().getContentResolver();
 
     Bitmap bitmap = null;
@@ -1067,14 +1948,28 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         int dstHeight = this.targetHeight;
 
         // =========================================================
-        // 1️⃣ Bounds만 읽기
+        // 0️⃣ URI 준비 대기 (race 방지)
+        // =========================================================
+        waitForUriReady(resolver, uri);
+        safeSleep(50);
+        
+        // =========================================================
+        // 1️⃣ Bounds 읽기 (FD 방식)
         // =========================================================
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inJustDecodeBounds = true;
 
-        try (InputStream is = resolver.openInputStream(uri)) {
-            if (is == null) throw new IOException("Cannot open input stream.");
-            BitmapFactory.decodeStream(is, null, options);
+        try (ParcelFileDescriptor pfd =
+                     resolver.openFileDescriptor(uri, "r")) {
+
+            if (pfd == null)
+                throw new IOException("Cannot open file descriptor.");
+
+            BitmapFactory.decodeFileDescriptor(
+                    pfd.getFileDescriptor(),
+                    null,
+                    options
+            );
         }
 
         if (options.outWidth <= 0 || options.outHeight <= 0) {
@@ -1082,21 +1977,28 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         }
 
         // =========================================================
-        // 2️⃣ EXIF 회전값 먼저 읽기 (bitmap 필요 없음)
+        // 2️⃣ EXIF rotation 읽기 (stream 방식)
         // =========================================================
         if (this.correctOrientation) {
             try (InputStream exifIs = resolver.openInputStream(uri)) {
+
                 if (exifIs != null) {
+
                     ExifInterface exif = new ExifInterface(exifIs);
+
                     int orientation = exif.getAttributeInt(
                             ExifInterface.TAG_ORIENTATION,
                             ExifInterface.ORIENTATION_NORMAL
                     );
 
-                    if (orientation == ExifInterface.ORIENTATION_ROTATE_90) rotationInDegrees = 90;
-                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_180) rotationInDegrees = 180;
-                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_270) rotationInDegrees = 270;
+                    if (orientation == ExifInterface.ORIENTATION_ROTATE_90)
+                        rotationInDegrees = 90;
+                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_180)
+                        rotationInDegrees = 180;
+                    else if (orientation == ExifInterface.ORIENTATION_ROTATE_270)
+                        rotationInDegrees = 270;
                 }
+
             } catch (Exception e) {
                 LOG.w(LOG_TAG, "Failed to read EXIF. Skipping rotation.", e);
             }
@@ -1105,40 +2007,41 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         // =========================================================
         // 3️⃣ inSampleSize 계산
         // =========================================================
+        boolean willRotate = (rotationInDegrees != 0);
+
         if (dstWidth > 0 && dstHeight > 0) {
-            options.inSampleSize = calculateSampleSize(
+            options.inSampleSize = calculateSampleSizeSmart(
+                    this.cordova.getActivity(), // ✅ Context 추가
                     options.outWidth,
                     options.outHeight,
                     dstWidth,
-                    dstHeight
+                    dstHeight,
+                    willRotate,
+                    true
             );
         } else {
             options.inSampleSize = 1;
         }
 
         // =========================================================
-        // 4️⃣ 실제 decode (🔥 메모리 핵심)
+        // 4️⃣ Decode + Retry (HEIC null/OOM 방지)
         // =========================================================
         options.inJustDecodeBounds = false;
-        options.inPreferredConfig = Bitmap.Config.RGB_565; // 🔥 50% 절감
+        options.inPreferredConfig = Bitmap.Config.RGB_565;
         options.inMutable = false;
         options.inDither = true;
 
-        try (InputStream is = resolver.openInputStream(uri)) {
-            bitmap = BitmapFactory.decodeStream(is, null, options);
-        } catch (OutOfMemoryError oom) {
-            LOG.e(LOG_TAG, "OOM during bitmap decode", oom);
-            throw new IOException("OOM_DECODE");
-        }
+        bitmap = decodeWithRetryFD(resolver, uri, options);
 
         if (bitmap == null) {
-            throw new IOException("Bitmap decode returned null.");
+            throw new IOException("Bitmap decode returned null after retry.");
         }
 
         // =========================================================
-        // 5️⃣ 회전 (최종 1회, 실패 시 원본 유지)
+        // 5️⃣ Rotate (OOM 시 fallback)
         // =========================================================
         if (rotationInDegrees != 0) {
+
             Matrix matrix = new Matrix();
             matrix.setRotate(rotationInDegrees);
 
@@ -1156,8 +2059,9 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                     bitmap.recycle();
                     bitmap = rotated;
                 }
-            } catch (OutOfMemoryError rotateOOM) {
-                LOG.w(LOG_TAG, "OOM during rotation. Using unrotated bitmap.", rotateOOM);
+
+            } catch (OutOfMemoryError ignored) {
+                //skip
             }
         }
 
@@ -1165,35 +2069,43 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         // 6️⃣ JPEG 저장
         // =========================================================
         File outFile = createCaptureFile(JPEG, System.currentTimeMillis() + "");
+        // 기존
+        // fos = new FileOutputStream(outFile);
+
+        // 변경 (BufferedOutputStream으로 감싸기)
         fos = new FileOutputStream(outFile);
+        BufferedOutputStream bos = new BufferedOutputStream(fos); // 버퍼링 추가
 
         boolean success = bitmap.compress(
                 Bitmap.CompressFormat.JPEG,
                 this.mQuality,
-                fos
+                bos // fos 대신 bos 전달
         );
+        bos.flush(); // 중요: 버퍼 비우기
+        // bos.close()는 finally 블록의 fos.close()에 의해 연쇄적으로 처리되거나, 
+        // 명시적으로 bos.close()를 호출해주면 좋습니다.
 
         if (!success) {
             throw new IOException("JPEG compression failed.");
         }
 
-        if (bitmap != null && !bitmap.isRecycled()) {
-            bitmap.recycle();
-            bitmap = null;
-        }
-
+        // bitmap 정리
+        bitmap.recycle();
+        bitmap = null;
 
         return "file://" + outFile.getAbsolutePath();
 
     } finally {
-        if (fos != null) try { fos.close(); } catch (IOException ignored) {}
+
+        if (fos != null) {
+            try { fos.close(); } catch (IOException ignored) {}
+        }
+
         if (bitmap != null && !bitmap.isRecycled()) {
             bitmap.recycle();
-            bitmap = null;
         }
     }
 }
-
 
 
 
@@ -1224,6 +2136,7 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
         int destType = (requestCode % 16) - 1;
 
         // If Camera Crop
+        /*
         if (requestCode >= CROP_CAMERA) {
             if (resultCode == Activity.RESULT_OK) {
         
@@ -1233,15 +2146,18 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
             // ThreadPool을 사용하여 백그라운드에서 실행
             cordova.getThreadPool().execute(() -> {
                 try {
+
                     processResultFromCamera(finalDestType, finalIntent);
                 } catch (IOException e) {
                     e.printStackTrace();
                     LOG.e(LOG_TAG, "Unable to write to file");
                     // 에러 발생 시 UI 스레드로 에러 전달 필요 시 runOnUiThread 사용
                     cordova.getActivity().runOnUiThread(() -> {
-                        failPicture("Unable to write to file");
+                       this.failPicture("Unable to write to file");
                     });
+                    logreport(e);
                 }
+                                
             });
 
             }
@@ -1255,8 +2171,9 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                 this.failPicture("Did not complete!");
             }
         }
+        */
         // If CAMERA
-        else if (srcType == CAMERA) {
+        if (srcType == CAMERA) {
             // If image available
             if (resultCode == Activity.RESULT_OK) {
                     
@@ -1266,7 +2183,7 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                                 
                                 Uri tmpFile = FileProvider.getUriForFile(
                                         cordova.getActivity(),
-                                        applicationId + ".cordova.plugin.camera.provider",
+                                        cordova.getActivity().getPackageName() + ".cordova.plugin.camera.provider",
                                         createCaptureFile(this.encodingType)
                                 );
                                 performCrop(tmpFile, destType, intent);
@@ -1275,12 +2192,13 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                         } catch (Exception e) {
                             e.printStackTrace();
                             this.failPicture("Error capturing image: " + e.getLocalizedMessage());
+                            logreport(e);
                         }
 
 
                 } else {
 
-
+                    /*
                     // final 캡처
                     final int finalDestType = destType;
                     final Intent finalIntent = intent;
@@ -1290,21 +2208,46 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                                 
                                 cordova.getThreadPool().execute(() -> {
                                 try {
-
-                                    //System.gc();
-                                    //System.runFinalization();
-
                                     processResultFromCamera(finalDestType, finalIntent);
-                                } catch (Exception e) {
-                                    e.printStackTrace();
-
-                                    cordova.getActivity().runOnUiThread(() -> {
-                                        failPicture("Error capturing image: " + e.getLocalizedMessage());
-                                    });                                    
-                                    //failPicture("Error capturing image: " + e.getLocalizedMessage());
-                                }
+                                } catch (Throwable t) {
+                                    // 2. [핵심] 여기서 모든 런타임 에러(OOM, NPE 등)를 잡아냄
+                                    LOG.e(LOG_TAG, "Fatal error in processResultFromCamera thread", t);
+                                   this.failPicture("Error processing camera image: " + t.getMessage());
+                                    logreport(t);
+                                }                                
+                                
+                                
                                 });
                             }, 50);
+                    */
+
+                    // final 캡처
+                    final int finalDestType = destType;
+                    final Intent finalIntent = intent;
+
+                    // 1. UI 스레드 안정화 대기 (100ms 권장)
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+
+                        // 2. 백그라운드 작업 시작
+                        cordova.getThreadPool().execute(() -> {
+                            try {
+                                // 실제 로직 실행 (동기 함수)
+                                processResultFromCamera(finalDestType, finalIntent);
+
+                            } catch (Throwable t) {
+                                // 3. 런타임 에러(OOM 등) 방어 및 로그 전송
+                                LOG.e(LOG_TAG, "Fatal error in processResultFromCamera thread", t);
+                                Activity act = cordova.getActivity();
+                                if (act != null && !act.isFinishing()) {
+                                    act.runOnUiThread(() ->
+                                       CameraLauncher.this.failPicture("Error processing camera image: " + t.getLocalizedMessage())
+                                    );
+                                }                                
+                                logreport(t);
+                            }
+                        });
+
+                    }, 100); // 50ms -> 100ms (저사양 기기 UI 복구 시간 확보)
                     
                     
                 }
@@ -1320,6 +2263,7 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
             // If something else
             else {
                 this.failPicture("Did not complete!");
+                logreport("Did not complete!");
             }
         }
         // If retrieving photo from library
@@ -1329,13 +2273,23 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                 final int finalDestType = destType;
                 cordova.getThreadPool().execute(new Runnable() {
                     public void run() {
+                        cleanupOldGooglePhotosQuirkFiles();
+                        try {
                         processResultFromGallery(finalDestType, i);
+                        } catch (Throwable t) {
+                            // 예상치 못한 모든 에러(OOM 포함)를 JS에 보고
+                            LOG.e(LOG_TAG, "Error in processResultFromGallery", t);
+                           CameraLauncher.this.failPicture("Error processing image: " + t.getMessage());
+                            logreport(t);
+                        }
+                       
                     }
                 });
             } else if (resultCode == Activity.RESULT_CANCELED) {
                 this.failPicture("No Image Selected");
             } else {
                 this.failPicture("Selection did not complete!");
+                logreport("Selection did not complete!");
             }
         }
     }
@@ -1377,6 +2331,7 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                     os.close();
                 } catch (IOException e) {
                     LOG.d(LOG_TAG, "Exception while closing output stream.");
+                    logreport(e);
                 }
             }
             if (fis != null) {
@@ -1384,6 +2339,7 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                     fis.close();
                 } catch (IOException e) {
                     LOG.d(LOG_TAG, "Exception while closing file input stream.");
+                    logreport(e);
                 }
             }
         }
@@ -1400,182 +2356,106 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                                                                   IOException {
 
         InputStream fis = FileHelper.getInputStreamFromUriString(src.toString(), cordova);
+
+        if (fis == null) {
+            throw new IOException("Failed to open input stream from URI: " + src);
+        }
+    
         writeUncompressedImage(fis, dest);
 
     }
 
-    /**
-     * Return a scaled and rotated bitmap based on the target width and height
-     *
-     * @param data
-     * @return
-     * @throws IOException
-     */
-    private Bitmap getScaledAndRotatedBitmap(byte[] data, String mimeType) throws IOException {
-        // If no new width or height were specified, and orientation is not needed return the original bitmap
-        if (this.targetWidth <= 0 && this.targetHeight <= 0 && !(this.correctOrientation)) {
-            Bitmap image = null;
-            try {
-                image = BitmapFactory.decodeStream(new ByteArrayInputStream(data));
-            } catch (OutOfMemoryError e) {
-                callbackContext.error(e.getLocalizedMessage());
-            } catch (Exception e) {
-                callbackContext.error(e.getLocalizedMessage());
-            }
-            return image;
-        }
-
-        int rotate = 0;
-        try {
-            try {
-                if (JPEG_MIME_TYPE.equalsIgnoreCase(mimeType)) {
-                    exifData = new ExifHelper();
-                    exifData.createInFile(new ByteArrayInputStream(data));
-                    exifData.readExifData();
-                    // Use ExifInterface to pull rotation information
-                    if (this.correctOrientation) {
-                        ExifInterface exif = new ExifInterface(new ByteArrayInputStream(data));
-                        rotate = exifToDegrees(exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED));
-                    }
-                }
-            } catch (Exception oe) {
-                LOG.w(LOG_TAG,"Unable to read Exif data: " + oe.toString());
-                rotate = 0;
-            }
-        } catch (Exception e) {
-            LOG.e(LOG_TAG,"Exception while getting input stream: " + e.toString());
-            return null;
-        }
-
-        // figure out the original width and height of the image
-        BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inJustDecodeBounds = true;
-        BitmapFactory.decodeStream(new ByteArrayInputStream(data), null, options);
-
-        //CB-2292: WTF? Why is the width null?
-        if (options.outWidth == 0 || options.outHeight == 0) {
-            return null;
-        }
-
-        // User didn't specify output dimensions, but they need orientation
-        if (this.targetWidth <= 0 && this.targetHeight <= 0) {
-            this.targetWidth = options.outWidth;
-            this.targetHeight = options.outHeight;
-        }
-
-        // Setup target width/height based on orientation
-        int rotatedWidth, rotatedHeight;
-        boolean rotated = false;
-        if (rotate == 90 || rotate == 270) {
-            rotatedWidth = options.outHeight;
-            rotatedHeight = options.outWidth;
-            rotated = true;
-        } else {
-            rotatedWidth = options.outWidth;
-            rotatedHeight = options.outHeight;
-        }
-
-        // determine the correct aspect ratio
-        int[] widthHeight = calculateAspectRatio(rotatedWidth, rotatedHeight);
-
-        // Load in the smallest bitmap possible that is closest to the size we want
-        options.inJustDecodeBounds = false;
-        options.inSampleSize = calculateSampleSize(rotatedWidth, rotatedHeight,  widthHeight[0], widthHeight[1]);
-        Bitmap unscaledBitmap = BitmapFactory.decodeStream(new ByteArrayInputStream(data), null, options);;
-
-        if (unscaledBitmap == null) {
-            return null;
-        }
-
-        int scaledWidth = (!rotated) ? widthHeight[0] : widthHeight[1];
-        int scaledHeight = (!rotated) ? widthHeight[1] : widthHeight[0];
-
-        Bitmap scaledBitmap = Bitmap.createScaledBitmap(unscaledBitmap, scaledWidth, scaledHeight, true);
-        if (scaledBitmap != unscaledBitmap) {
-            unscaledBitmap.recycle();
-            unscaledBitmap = null;
-        }
-
-        if (this.correctOrientation && (rotate != 0)) {
-            Matrix matrix = new Matrix();
-            matrix.setRotate(rotate);
-            try {
-                scaledBitmap = Bitmap.createBitmap(scaledBitmap, 0, 0, scaledBitmap.getWidth(), scaledBitmap.getHeight(), matrix, true);
-                this.orientationCorrected = true;
-            } catch (OutOfMemoryError oom) {
-                this.orientationCorrected = false;
-            }
-        }
-        return scaledBitmap;
+// =========================================================================
+    // [오버로딩] 기존 호출부와의 호환성을 위해 isHeic 기본값을 false로 처리하는 래퍼 메서드
+    // 기존에 calculateSampleSizeSmart(...)를 호출하던 곳은 에러 없이 이 메서드를 탑니다.
+    // =========================================================================
+    public static int calculateSampleSizeSmart(
+            Context context,
+            int srcWidth, int srcHeight,
+            int dstWidth, int dstHeight,
+            boolean willRotate
+    ) {
+        return calculateSampleSizeSmart(context, srcWidth, srcHeight, dstWidth, dstHeight, willRotate, false);
     }
 
-    /**
-     * Maintain the aspect ratio so the resulting image does not look smooshed
-     *
-     * @param origWidth
-     * @param origHeight
-     * @return
-     */
-    public int[] calculateAspectRatio(int origWidth, int origHeight) {
-        int newWidth = this.targetWidth;
-        int newHeight = this.targetHeight;
-
-        // If no new width or height were specified return the original bitmap
-        if (newWidth <= 0 && newHeight <= 0) {
-            newWidth = origWidth;
-            newHeight = origHeight;
-        }
-        // Only the width was specified
-        else if (newWidth > 0 && newHeight <= 0) {
-            newHeight = (int)((double)(newWidth / (double)origWidth) * origHeight);
-        }
-        // only the height was specified
-        else if (newWidth <= 0 && newHeight > 0) {
-            newWidth = (int)((double)(newHeight / (double)origHeight) * origWidth);
-        }
-        // If the user specified both a positive width and height
-        // (potentially different aspect ratio) then the width or height is
-        // scaled so that the image fits while maintaining aspect ratio.
-        // Alternatively, the specified width and height could have been
-        // kept and Bitmap.SCALE_TO_FIT specified when scaling, but this
-        // would result in whitespace in the new image.
-        else {
-            double newRatio = newWidth / (double) newHeight;
-            double origRatio = origWidth / (double) origHeight;
-
-            if (origRatio > newRatio) {
-                newHeight = (newWidth * origHeight) / origWidth;
-            } else if (origRatio < newRatio) {
-                newWidth = (newHeight * origWidth) / origHeight;
-            }
-        }
-
-        int[] retval = new int[2];
-        retval[0] = newWidth;
-        retval[1] = newHeight;
-        return retval;
-    }
-
-    /**
-     * Figure out what ratio we can load our image into memory at while still being bigger than
-     * our desired width and height
-     *
-     * @param srcWidth
-     * @param srcHeight
-     * @param dstWidth
-     * @param dstHeight
-     * @return
-     */
-    public static int calculateSampleSize(int srcWidth, int srcHeight, int dstWidth, int dstHeight) {
-        final float srcAspect = (float) srcWidth / (float) srcHeight;
-        final float dstAspect = (float) dstWidth / (float) dstHeight;
+    // =========================================================================
+    // [메인 로직] isHeic 파라미터가 추가된 실제 계산 메서드
+    // =========================================================================
+    public static int calculateSampleSizeSmart(
+            Context context,
+            int srcWidth, int srcHeight,
+            int dstWidth, int dstHeight,
+            boolean willRotate,
+            boolean isHeic // <-- 추가된 HEIC 판별 파라미터
+    ) {
+        // 1) Raw 계산 (비율 기준)
+        int raw;
+        float srcAspect = (float) srcWidth / srcHeight;
+        float dstAspect = (float) dstWidth / dstHeight;
 
         if (srcAspect > dstAspect) {
-            return srcWidth / dstWidth;
+            raw = srcWidth / dstWidth;
         } else {
-            return srcHeight / dstHeight;
+            raw = srcHeight / dstHeight;
+        }
+        if (raw < 1) raw = 1;
+
+        // 2) 무조건 2의 거듭제곱으로 올림 (Ceil)
+        int sample = 1;
+        while (sample < raw) {
+            sample *= 2;
+        }
+
+        // 3) 실제 Sample 기준 예상 메모리 계산 (RGB_565 = 2bytes)
+        int expectedW = srcWidth / sample;
+        int expectedH = srcHeight / sample;
+        long bitmapBytes = (long) expectedW * expectedH * 2;
+
+        // Rotate(3배) vs DecodeOnly(2배)
+        long requiredBytes = willRotate ? bitmapBytes * 3 : bitmapBytes * 2;
+
+        // =======================================================
+        // [핵심 변경점] HEIC vs JPG 메모리 차등 계산
+        // HEIC는 압축을 푸는 과정에서 막대한 Native 메모리 스파이크가 발생합니다.
+        // 따라서 요구 메모리를 일반 이미지 대비 2.5배 크게 부풀려서 보수적으로 평가합니다.
+        // =======================================================
+        if (isHeic) {
+            requiredBytes = (long) (requiredBytes * 2.5);
+        }
+
+        // 4) Heap 여유 계산
+        Runtime rt = Runtime.getRuntime();
+        long freeHeap = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory());
+
+        // 5) Device 체급 + LowRam 여부 기반 safety 조정
+        ActivityManager am =
+                (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+
+        int memClass = am.getMemoryClass(); // 예: 128 / 256 / 512
+        boolean lowRam = am.isLowRamDevice();
+
+        // 기본 safety (기기 체급 기반)
+        float safety;
+        if (memClass <= 128) safety = 0.20f;
+        else if (memClass <= 256) safety = 0.30f;
+        else safety = 0.40f;
+
+        // LowRamDevice면 더 보수적으로
+        if (lowRam) {
+            safety *= 0.75f;   // 예: 0.30 → 0.225
+        }
+
+        // 6) 최종 메모리 평가 및 추가 축소 방어
+        if (requiredBytes < freeHeap * safety) {
+            // 여유가 있다면 (JPG이거나 기기 스펙이 매우 좋거나)
+            return sample;
+        } else {
+            // HEIC 가중치 때문에 초과했거나 진짜 메모리가 부족하다면 강제로 한 단계 더 축소 (*2)
+            // sample을 2배 키우면 결과물 픽셀 면적은 1/4이 되므로 OOM을 완벽히 방어합니다.
+            return sample * 2;
         }
     }
+
 
     /**
      * Cleans up after picture taking. Checking for duplicates and that kind of stuff.
@@ -1583,16 +2463,22 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
      * @param newImage
      */
     private void cleanup(Uri oldImage, Uri newImage, Bitmap bitmap) {
-        if (bitmap != null) {
-            bitmap.recycle();
-        }
+        try {
+            if (bitmap != null) {
+                bitmap.recycle();
+            }
 
-        // Clean up initial camera-written image file.
-        (new File(FileHelper.stripFileProtocol(oldImage.toString()))).delete();
+            // Clean up initial camera-written image file.
+            (new File(FileHelper.stripFileProtocol(oldImage.toString()))).delete();
 
-        // Scan for the gallery to update pic refs in gallery
-        if (this.saveToPhotoAlbum && newImage != null) {
-            this.scanForGallery(newImage);
+            // Scan for the gallery to update pic refs in gallery
+            if (this.saveToPhotoAlbum && newImage != null) {
+                this.scanForGallery(newImage);
+            }
+        
+        } catch (Exception e) {
+        // 청소 실패는 치명적이지 않으므로 로그만 남김
+        LOG.w(LOG_TAG, "Failed to cleanup: " + e.getMessage());
         }
 
         System.gc();
@@ -1635,6 +2521,7 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
             }
         } catch (Exception e) {
             this.failPicture("Error compressing image: "+e.getLocalizedMessage());
+            logreport(e);
         }
     }
 
@@ -1644,8 +2531,17 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
      * @param err
      */
     public void failPicture(String err) {
+        if (this.callbackContext!=null)
         this.callbackContext.error(err);
     }
+
+
+
+
+
+
+
+
 
     private void scanForGallery(Uri newImage) {
         this.scanMe = newImage;
@@ -1742,8 +2638,12 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
     // [새로 추가할 메서드] 메모리 및 캐시 강제 정리
     private void releaseMemory() {
         // 1. Java Heap 메모리 청소 유도 (OS에 힌트 전달)
+        try {
         System.gc();
         System.runFinalization();
+        } catch (Exception ignore) {}
+        
+        if (cordova == null || cordova.getActivity() == null) return;
 
         // 2. WebView 캐시 정리 (RAM에 상주하는 이미지 리소스 등 해제)
         // WebView 조작은 반드시 UI 스레드에서 해야 함
@@ -1753,10 +2653,13 @@ private String convertHeicToJpeg(Uri uri) throws IOException {
                 try {
                     // true: 디스크 캐시와 메모리 캐시를 모두 비웁니다.
                     // 이미 loading.html로 왔으므로 이전 페이지 리소스를 다 날려도 안전합니다.
-                    webView.clearCache(true); 
+                    if (webView != null) {
+                        webView.clearCache(true);
+                    }
                 } catch (Exception e) {
                     LOG.e(LOG_TAG, "Error clearing webview cache", e);
                 }
+                
             }
         });
     }

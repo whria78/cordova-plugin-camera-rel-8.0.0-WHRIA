@@ -312,7 +312,8 @@ public class FileHelper {
      */
     public static boolean isFileProviderUri(final Context context, final Uri uri) {
         final String packageName = context.getPackageName();
-        final String authority = new StringBuilder(packageName).append(".provider").toString();
+        // 우리가 plugin.xml과 CameraLauncher에서 설정한 전체 주소와 일치시켜야 합니다.
+        final String authority = new StringBuilder(packageName).append(".cordova.plugin.camera.provider").toString();
         return authority.equals(uri.getAuthority());
     }
 
