@@ -5,6 +5,7 @@ import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.util.Locale;            // 추가 필요 (SimpleDateFormat 인자 사용 시)
 import java.io.FileDescriptor; // [중요] 추가됨
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -731,7 +732,7 @@ private File createCaptureFile(int encodingType, String fileName) {
      * @param destType          In which form should we return the image
      * @param intent            An Intent, which can return result data to the caller.
      */
-// [수정] processResultFromCamera (안전성 강화 버전)
+// [최종 수정] processResultFromCamera (HONOR/SDK 33 레이스 컨디션 해결 버전)
 private void processResultFromCamera(int destType, Intent intent) throws IOException {
 
     if (cordova.getActivity() == null || cordova.getActivity().isFinishing()) {
@@ -741,40 +742,174 @@ private void processResultFromCamera(int destType, Intent intent) throws IOExcep
     
     // 1. 기본 타겟 설정
     Uri sourceUri = this.imageUri; 
-    if (this.allowEdit && this.croppedUri != null) {
-        sourceUri = this.croppedUri;
-    }
 
     ContentResolver resolver = cordova.getActivity().getContentResolver();
     boolean sourceExists = false;
 
     // =========================================================================
-    // 1단계: 원본 파일 존재 확인
+    // 1단계 & 2단계 통합: 원본 및 Fallback 파일 존재 확인 (강화된 Retry)
     // =========================================================================
-    try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(sourceUri, "r")) {
-        if (pfd != null) {
-            sourceExists = true;
+    
+    // [보강] 우선 기존 sourceUri에 대해 최대 3.2초간(400ms * 8) 재시도 루프를 돕니다.
+    // 많은 제조사 기기에서 파일이 실제로 쓰여지기까지 시간이 걸립니다.
+    int retryCount = 0;
+    while (retryCount < 8 && !sourceExists) {
+        try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(sourceUri, "r")) {
+            if (pfd != null && pfd.getStatSize() > 0) {
+                sourceExists = true;
+                LOG.d(LOG_TAG, "Source file found on attempt " + (retryCount + 1));
+            }
+        } catch (Exception e) {
+            // 아직 파일이 없거나 접근 불가
         }
-    } catch (Exception e) {
-        sourceExists = false;
+
+        if (!sourceExists) {
+            try { Thread.sleep(400); } catch (InterruptedException ignored) {}
+            retryCount++;
+        }
     }
 
+    // [보강] 만약 원본 Uri로 실패했다면, Intent Data(Fallback)를 확인하고 재검증합니다.
+    if (!sourceExists) {
+        LOG.w(LOG_TAG, "Original sourceUri failed. Checking intent fallback...");
+        
+        Uri fallbackUri = (intent != null) ? intent.getData() : null;
+        
+        if (fallbackUri != null) {
+            int fallbackRetry = 0;
+            while (fallbackRetry < 3 && !sourceExists) { // Fallback에 대해서도 짧게 재시도
+                try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(fallbackUri, "r")) {
+                    if (pfd != null && pfd.getStatSize() > 0) {
+                        sourceUri = fallbackUri; // 성공 시 sourceUri 교체
+                        sourceExists = true;
+                        LOG.d(LOG_TAG, "Recovered using Fallback URI.");
+                    }
+                } catch (Exception e) {
+                    // 실패 시 대기
+                }
+                
+                if (!sourceExists) {
+                    try { Thread.sleep(400); } catch (InterruptedException ignored) {}
+                    fallbackRetry++;
+                }
+            }
+        }
+    }
+
+
     // =========================================================================
-    // 2단계: Fallback 로직
+    // [보강] 3단계 (최후의 수단): 캐시 폴더 강제 스캔 및 EXIF 2차 검증 (Heuristic Fallback)
     // =========================================================================
     if (!sourceExists) {
-        LOG.w(LOG_TAG, "Original file not found: " + sourceUri);
+        LOG.w(LOG_TAG, "Intent fallback also failed. Scanning cache directory as last resort...");
+        
+        File cameraCacheDir = new File(cordova.getActivity().getCacheDir(), "org.apache.cordova.camera");
+        File rootCacheDir = cordova.getActivity().getCacheDir();
+        File[] searchDirs = { cameraCacheDir, rootCacheDir };
+        
+        long now = System.currentTimeMillis();
+        File bestCandidate = null;
+        long bestTime = 0;
 
-        if (intent != null && intent.getData() != null) {
-            sourceUri = intent.getData();
-            LOG.w(LOG_TAG, "Recovered using Intent Data: " + sourceUri);
-        } else {
-            LOG.e(LOG_TAG, "All fallback attempts failed. File is missing.");
-            logreport("Unable to find the captured file.");
-            this.failPicture("Unable to find the captured file.");
-            return;
+        // 1. 파일 시스템 기반 1차 필터링 (빠른 탐색)
+        for (File dir : searchDirs) {
+            if (dir != null && dir.exists() && dir.isDirectory()) {
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        if (!f.isFile()) continue;
+                        
+                        // OS 파일 수정 시간이 20초(20000ms) 이내인지 1차 확인
+                        long fileAge = now - f.lastModified();
+                        if (fileAge >= 0 && fileAge < 20000) {
+                            
+                            // Bounds만 읽어 해상도 2000x2000 이상인지 확인 (OOM 방지)
+                            BitmapFactory.Options options = new BitmapFactory.Options();
+                            options.inJustDecodeBounds = true;
+                            BitmapFactory.decodeFile(f.getAbsolutePath(), options);
+                            
+                            if (options.outWidth >= 2000 || options.outHeight >= 2000) {
+                                if (f.lastModified() > bestTime) {
+                                    bestTime = f.lastModified();
+                                    bestCandidate = f;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 2. 찾아낸 단 1개의 파일에 대해 EXIF 촬영 시간 2차 검증
+        if (bestCandidate != null) {
+            boolean isExifValid = false;
+            try {
+                ExifInterface exif = new ExifInterface(bestCandidate.getAbsolutePath());
+                // 원본 촬영 시간 (우선순위 1)
+                String dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL);
+                // 수정 시간 (우선순위 2 - Original이 없는 기기 대비)
+                if (dateTime == null) {
+                    dateTime = exif.getAttribute(ExifInterface.TAG_DATETIME);
+                }
+                
+                if (dateTime != null) {
+                    // EXIF 시간 포맷: "yyyy:MM:dd HH:mm:ss"
+                    java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy:MM:dd HH:mm:ss", java.util.Locale.US);
+                    java.util.Date exifDate = sdf.parse(dateTime);
+                    
+                    if (exifDate != null) {
+                        long diff = Math.abs(now - exifDate.getTime());
+                        if (diff <= 20000) { // EXIF 기준 20초 이내 확인
+                            isExifValid = true;
+                            LOG.d(LOG_TAG, "EXIF datetime verified successfully. Diff: " + diff + "ms");
+                        } else {
+                            LOG.w(LOG_TAG, "EXIF time is too old. Diff: " + diff + "ms. Rejecting file.");
+                        }
+                    }
+                } else {
+                    // EXIF 데이터가 아예 없는 경우 (일부 커스텀 롬 카메라 앱)
+                    // 파일 시스템 시간과 해상도 조건을 통과했으므로 유효한 것으로 간주
+                    LOG.w(LOG_TAG, "No EXIF datetime found, but trusting file system time.");
+                    isExifValid = true; 
+                }
+            } catch (Exception e) {
+                LOG.e(LOG_TAG, "Failed to parse EXIF for fallback candidate", e);
+                // 파싱 에러 시에도 최후의 수단이므로 일단 신뢰하여 진행
+                isExifValid = true; 
+            }
+
+            // 3. 모든 검증을 통과했다면 sourceUri 부활!
+            if (isExifValid) {
+                LOG.w(LOG_TAG, "BINGO! Found and verified matching captured file: " + bestCandidate.getAbsolutePath());
+                sourceUri = FileProvider.getUriForFile(
+                        cordova.getActivity(),
+                        cordova.getActivity().getPackageName() + ".cordova.plugin.camera.provider",
+                        bestCandidate
+                );
+                sourceExists = true;
+            } else {
+                bestCandidate = null; // 조건 미달 시 후보 탈락
+            }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // 진짜 최종적으로 실패한 경우 (기존 코드)
+    // -------------------------------------------------------------------------
+    if (!sourceExists) {
+        LOG.e(LOG_TAG, "All attempts to find the captured file failed.");
+        logreport("Unable to find the captured file. (Cache scan & EXIF verify failed)");
+        this.failPicture("Unable to find the captured file.");
+        return;
+    }
+
+    // 최종적으로 실패한 경우
+    if (!sourceExists) {
+        LOG.e(LOG_TAG, "All attempts to find the captured file failed.");
+        logreport("Unable to find the captured file. (HONOR/SDK33 Patch applied)");
+        this.failPicture("Unable to find the captured file.");
+        return;
+    }    
 
     // =========================================================================
     // 3단계: Exif & Rotation 준비
@@ -1241,9 +1376,20 @@ private void processResultFromGallery_ex(int destType, Intent intent) {
         return;
     }
 
+
     String uriString = uri.toString();
     Uri originalUri = uri;
     ContentResolver resolver = cordova.getActivity().getContentResolver();
+
+    if (uri != null && "content".equals(uri.getScheme())) {
+        try {
+            // 안드로이드 시스템에 이 URI의 권한을 유지해달라고 요청 (SDK 36 대응)
+            int takeFlags = intent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            resolver.takePersistableUriPermission(uri, takeFlags);
+        } catch (SecurityException e) {
+            LOG.w(LOG_TAG, "Persistable permission not granted (normal for some pickers)");
+        }
+    }
 
     // 2. MIME Type 확인 (한 번만 수행하여 계속 재사용)
     String mimeType = resolver.getType(uri);
@@ -1338,27 +1484,46 @@ private void processResultFromGallery_ex(int destType, Intent intent) {
     }
 
     // =========================================================================
-    // [FIX 2] HEIC 판별 (위에서 구한 mimeType 재사용)
+    // [강화된 HEIC 판별 로직]
     // =========================================================================
     boolean isHeic = false;
 
+    // 1. MIME Type을 통한 1차 판별 (가장 빠름)
     if (mimeType != null) {
-
         String m = mimeType.toLowerCase();
         isHeic = m.contains("heic") || m.contains("heif");
-        
     }
 
+    // 2. 파일 확장자를 통한 2차 판별 (MIME이 null이거나 일반 octet-stream일 경우)
     if (!isHeic) {
-        String name = getFileNameFromUri(uri);
-        if (name != null) {
-            String lower = name.toLowerCase();
-            if (lower.endsWith(".heic") || lower.endsWith(".heif")) {
-                isHeic = true;
-            }
+        String fileName = getFileNameFromUri(uri);
+        if (fileName != null) {
+            String lowerName = fileName.toLowerCase();
+            isHeic = lowerName.endsWith(".heic") || lowerName.endsWith(".heif") || lowerName.endsWith(".hif");
         }
     }
 
+    // 3. 파일 시그니처(Magic Bytes)를 통한 3차 판별 (가장 확실함)
+    // 최신 삼성 기기에서 MIME이나 확장자가 불분명하게 넘어올 때를 대비
+    if (!isHeic) {
+        try (InputStream is = resolver.openInputStream(uri)) {
+            if (is != null) {
+                byte[] header = new byte[12];
+                if (is.read(header) >= 12) {
+                    String signature = new String(header, 4, 8, StandardCharsets.UTF_8);
+                    // HEIC/HEIF 파일은 4~12바이트 지점에 ftypheic, ftypheix, ftypmif1 등을 포함함
+                    if (signature.contains("ftypheic") || signature.contains("ftypheix") || 
+                        signature.contains("ftypmif1") || signature.contains("ftypmsf1") ||
+                        signature.contains("ftyphevc") || signature.contains("ftyphevx")) {
+                        isHeic = true;
+                        LOG.d(LOG_TAG, "HEIC detected by file signature (Magic Bytes)");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.w(LOG_TAG, "Failed to check file signature for HEIC", e);
+        }
+    }
 
     if (isHeic) {
         // 원래 해상도 저장
